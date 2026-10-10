@@ -1,0 +1,8 @@
+# LumiTag tests are standalone: do NOT preload Lumiverse's frontend DOM shim.
+# LumiTag's unit tests target pure logic (tag index, query parser/evaluator,
+# mutation planner, mutation executor) and must not depend on host globals.
+[test]
+preload = []
+
+[install]
+peer = false

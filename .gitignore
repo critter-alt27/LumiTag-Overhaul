@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+bun.lock
+# Tooling scratch (test/bundler logs, coverage output). Source and fixtures
+# under src/ and tests/ stay tracked.
+coverage/
+
+# The repository root .gitignore excludes `*.md` globally (it is a docs-build
+# guard for the host app). LumiTag's markdown deliverables must ship with the
+# extension, so re-include them. A .gitignore in a deeper directory takes
+# precedence over shallower patterns.
+!DEVELOPMENT_NOTES.md
+!README.md
