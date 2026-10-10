@@ -1,5 +1,6 @@
-import { describe, expect, test } from 'bun:test'
+import { beforeEach, describe, expect, test } from 'bun:test'
 
+import type { SpindleAPI } from 'lumiverse-spindle-types'
 import { normalizeCharacter, normalizeCharacterTags } from '../src/shared/normalize'
 import type { BackendRequest, BackendResponse } from '../src/shared/protocol'
 import { BACKEND_PAGE_LIMIT, type LumiTagCharacter } from '../src/shared/types'
@@ -708,5 +709,203 @@ describe('CharacterRepository.avatarUrl', () => {
     const repo = new CharacterRepository({} as unknown as SpindleRpc)
     expect(repo.avatarUrl('abc-123')).toBe('/api/v1/characters/abc-123/avatar')
     expect(repo.avatarUrl('a/b?c=d')).toBe('/api/v1/characters/a%2Fb%3Fc%3Dd/avatar')
+  })
+})
+/* -------------------------------------------------------------------------- */
+/* backend: envelope userId forwarding                                        */
+/* -------------------------------------------------------------------------- */
+
+/** One recorded host character call, as (method, positional args). */
+interface SpindleCall {
+  method: 'list' | 'get' | 'update'
+  args: unknown[]
+}
+
+/** One outbound reply, as (payload, target userId). */
+interface SpindleReply {
+  payload: BackendResponse
+  userId: string
+}
+
+/**
+ * A fake `spindle` global that records every character call and every reply.
+ *
+ * `onFrontendMessage` is captured exactly once (at module import) the way the
+ * real host does it, so `deliver` is the single entry point every test drives.
+ * The character stubs succeed by default; `failNext` makes the *next* call
+ * throw so the worker's error path can be exercised.
+ */
+function createFakeSpindle() {
+  const calls: SpindleCall[] = []
+  const replies: SpindleReply[] = []
+  const warnings: string[] = []
+  let handler: ((payload: unknown, userId: string) => void) | null = null
+  let failure: Error | null = null
+
+  const spindle = {
+    characters: {
+      async list(...args: unknown[]) {
+        calls.push({ method: 'list', args })
+        if (failure) { const err = failure; failure = null; throw err }
+        return { data: [character('c1')], total: 1 }
+      },
+      async get(...args: unknown[]) {
+        calls.push({ method: 'get', args })
+        if (failure) { const err = failure; failure = null; throw err }
+        return { id: 'c1', name: 'Character c1', tags: [] }
+      },
+      async update(...args: unknown[]) {
+        calls.push({ method: 'update', args })
+        if (failure) { const err = failure; failure = null; throw err }
+        return { id: 'c1', name: 'Character c1', tags: [] }
+      },
+    },
+    onFrontendMessage(fn: (payload: unknown, userId: string) => void) {
+      handler = fn
+      return () => { handler = null }
+    },
+    sendToFrontend(payload: unknown, userId: string) {
+      replies.push({ payload: payload as BackendResponse, userId })
+    },
+    log: {
+      info() {},
+      warn(message: string) { warnings.push(message) },
+      error() {},
+    },
+  }
+
+  // `src/backend.ts` reads `spindle` off the global scope and registers its
+  // handler at import time, so install the fake first and import after.
+  ;(globalThis as { spindle?: unknown }).spindle = spindle
+  return {
+    spindle,
+    calls,
+    replies,
+    warnings,
+    reset() {
+      calls.length = 0
+      replies.length = 0
+      warnings.length = 0
+      failure = null
+    },
+    /** Make the next host character call reject, mimicking a host throw. */
+    failNext(err: Error) { failure = err },
+    /** Hand a frontend message to the worker with an envelope userId. */
+    deliver(payload: unknown, userId: string) {
+      if (!handler) throw new Error('backend never registered an onFrontendMessage handler')
+      handler(payload, userId)
+    },
+  }
+}
+
+const ENVELOPE_USER_ID = 'user-42'
+const host = createFakeSpindle()
+await import('../src/backend')
+
+describe('backend forwards the envelope userId to host character calls', () => {
+  beforeEach(() => host.reset())
+
+  test('characters.list receives the userId from the onFrontendMessage envelope', async () => {
+    host.deliver({ type: 'characters.list', requestId: 'r1', limit: 10, offset: 0 }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.calls).toHaveLength(1)
+    expect(host.calls[0]!.method).toBe('list')
+    // Regression: this argument was absent, which made the host throw
+    // "userId is required for operator-scoped extensions".
+    expect(host.calls[0]!.args[0]).toEqual({ limit: 10, offset: 0, userId: ENVELOPE_USER_ID })
+  })
+
+  test('characters.get receives the userId from the envelope', async () => {
+    host.deliver({ type: 'characters.get', requestId: 'r2', characterId: 'c1' }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.calls).toHaveLength(1)
+    expect(host.calls[0]!.method).toBe('get')
+    expect(host.calls[0]!.args).toEqual(['c1', ENVELOPE_USER_ID])
+  })
+
+  test('characters.update receives the userId from the envelope', async () => {
+    host.deliver(
+      { type: 'characters.updateTags', requestId: 'r3', characterId: 'c1', tags: [' Elf ', 'elf', ' Wizard '] },
+      ENVELOPE_USER_ID,
+    )
+    await flush()
+
+    expect(host.calls).toHaveLength(1)
+    expect(host.calls[0]!.method).toBe('update')
+    expect(host.calls[0]!.args).toEqual([
+      'c1',
+      // Tags stay normalized on the way through — userId is appended, not swapped in.
+      { tags: ['Elf', 'Wizard'] },
+      ENVELOPE_USER_ID,
+    ])
+  })
+
+  test('each connection gets its own userId, never a cached one', async () => {
+    host.deliver({ type: 'characters.get', requestId: 'r4', characterId: 'c1' }, 'user-a')
+    host.deliver({ type: 'characters.get', requestId: 'r5', characterId: 'c1' }, 'user-b')
+    await flush()
+
+    expect(host.calls.map((c) => c.args[1])).toEqual(['user-a', 'user-b'])
+    expect(host.replies.map((r) => r.userId)).toEqual(['user-a', 'user-b'])
+  })
+
+  test('replies are routed back to the same envelope userId', async () => {
+    host.deliver({ type: 'characters.list', requestId: 'r6', limit: 5, offset: 0 }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.replies).toHaveLength(1)
+    expect(host.replies[0]!.userId).toBe(ENVELOPE_USER_ID)
+    expect(host.replies[0]!.payload.type).toBe('characters.list.result')
+  })
+})
+
+describe('backend user-scope failure handling', () => {
+  beforeEach(() => host.reset())
+
+  test('never calls the host with an empty userId; answers scope_unresolved instead', async () => {
+    host.deliver({ type: 'characters.list', requestId: 'r7', limit: 5, offset: 0 }, '')
+    await flush()
+
+    // Nothing reaches the host: there is no honest id to send.
+    expect(host.calls).toHaveLength(0)
+    expect(host.warnings).toHaveLength(1)
+    expect(host.replies[0]!.payload).toMatchObject({
+      type: 'error',
+      requestId: 'r7',
+      code: 'scope_unresolved',
+      retryable: false,
+    })
+  })
+
+  test('classifies the host operator-scoped error as scope_unresolved, not invalid_input', async () => {
+    host.failNext(new Error('userId is required for operator-scoped extensions'))
+    host.deliver({ type: 'characters.list', requestId: 'r8', limit: 5, offset: 0 }, ENVELOPE_USER_ID)
+    await flush()
+
+    const error = host.replies[0]!.payload as Extract<BackendResponse, { type: 'error' }>
+    // "required" would otherwise pull this into invalid_input, blaming the
+    // frontend request for what is a scope-resolution failure.
+    expect(error.code).toBe('scope_unresolved')
+    expect(error.retryable).toBe(false)
+    // No stack trace crosses the boundary.
+    expect(error.message).toBe('userId is required for operator-scoped extensions')
+  })
+
+  test('a genuine invalid-input failure is still invalid_input', async () => {
+    host.failNext(new Error('tag must be a string'))
+    host.deliver({ type: 'characters.updateTags', requestId: 'r9', characterId: 'c1', tags: ['a'] }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.replies[0]!.payload).toMatchObject({ code: 'invalid_input', retryable: false })
+  })
+
+  test('a permission failure is still forbidden', async () => {
+    host.failNext(new Error('permission denied: characters'))
+    host.deliver({ type: 'characters.get', requestId: 'r10', characterId: 'c1' }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.replies[0]!.payload).toMatchObject({ code: 'forbidden', retryable: false })
   })
 })
