@@ -81,7 +81,14 @@ export const LUMITAG_CSS = `
   display: flex;
   flex-direction: column;
   gap: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--lumiverse-border) var(--lumiverse-fill-subtle);
 }
+
+.lt-app__body::-webkit-scrollbar { width: 8px; }
+.lt-app__body::-webkit-scrollbar-track { background: var(--lumiverse-fill-subtle); }
+.lt-app__body::-webkit-scrollbar-thumb { background: var(--lumiverse-border); border-radius: var(--lumiverse-radius); }
+.lt-app__body::-webkit-scrollbar-thumb:hover { background: var(--lumiverse-text-muted); }
 
 /* ------------------------------------------------------------------ */
 /* Tab strip (Tags / Characters)                                       */
@@ -651,7 +658,7 @@ export const LUMITAG_CSS = `
 .lt-tag-picker__body {
   margin-top: 8px;
   padding-top: 8px;
-  border-top: 1px solid var(--lumiverse-border, rgba(127, 127, 127, 0.3));
+  border-top: 1px solid color-mix(in srgb, var(--lumiverse-border) 30%, transparent);
 }
 
 .lt-tag-picker__sub {
@@ -739,7 +746,7 @@ export const LUMITAG_CSS = `
   /* --lumiverse-text is only inherited by overlays inside a themed ancestor.
      The CanvasText fallback keeps the scrim legible if a host scopes its theme
      variables to a subtree instead of :root. */
-  background: color-mix(in srgb, var(--lumiverse-text, CanvasText) 45%, transparent);
+  background: color-mix(in srgb, var(--lumiverse-text) 20%, transparent);
   /* The overlay is the sizing context every dialog is measured against: with
      box-sizing: border-box its 12px padding is guaranteed to be inside the
      box, so width: 100% on the panel means "the padded content box" and the
@@ -955,6 +962,8 @@ export const LUMITAG_CSS = `
 /* ------------------------------------------------------------------ */
 /* Sticky failure report panel                                         */
 /* ------------------------------------------------------------------ */
+.lt-app__failure-region { min-height: 0; }
+
 .lt-failures {
   position: sticky;
   bottom: 0;
@@ -1108,6 +1117,14 @@ export const LUMITAG_CSS = `
 
 .lt-state--error .lt-state__title { color: var(--lumiverse-text); }
 
+.lt-state--empty {
+  border-color: var(--lumiverse-border);
+  background: var(--lumiverse-fill-subtle);
+  color: var(--lumiverse-text-muted);
+}
+
+.lt-state--empty .lt-state__title { color: var(--lumiverse-text-muted); }
+
 .lt-state__actions {
   display: flex;
   gap: 6px;
@@ -1122,6 +1139,8 @@ export const LUMITAG_CSS = `
   color: var(--lumiverse-text-muted);
   font-size: 12px;
 }
+
+.lt-spinner__label { font-size: 11px; color: var(--lumiverse-text-muted); }
 
 .lt-spinner__ring {
   width: 14px;
@@ -1221,10 +1240,6 @@ export const LUMITAG_CSS = `
   .lt-tag-expanded { margin-left: 8px; }
 }
 
-@media (max-width: 520px) {
-  .lt-toolbar { flex-direction: column; align-items: stretch; }
-  .lt-toolbar__actions { justify-content: flex-start; }
-}
 
 /* ------------------------------------------------------------------ */
 /* Accessibility                                                       */
@@ -1266,97 +1281,15 @@ export const LUMITAG_CSS = `
 /* Kept as a final, scoped override layer so existing component logic   */
 /* and the original stylesheet remain untouched.                       */
 /* ------------------------------------------------------------------ */
-.lt-app,
-.lt-dialog-overlay {
-  --lumiverse-accent: var(--lumiverse-primary, var(--lumiverse-accent));
-  --lumiverse-accent-fg: var(--lumiverse-on-primary, var(--lumiverse-primary-contrast, var(--lumiverse-text)));
-}
-
 .lt-app {
-  font-family: var(--lumiverse-font-family, inherit);
-  gap: 10px;
-}
-
-.lt-app__header {
-  padding-bottom: 2px;
-}
-
-.lt-app__title {
-  letter-spacing: -0.015em;
-}
-
-.lt-tabs {
-  gap: 3px;
-  padding-bottom: 0;
-}
-
-.lt-tab {
-  border-radius: var(--lumiverse-radius-md, var(--lumiverse-radius));
-  padding: 6px 12px;
-}
-
-.lt-tab[aria-selected="true"] {
-  border-color: transparent;
-  box-shadow: inset 0 -2px 0 var(--lumiverse-primary, var(--lumiverse-accent));
-}
-
-.lt-btn,
-.lt-search,
-.lt-select,
-.lt-input {
-  border-radius: var(--lumiverse-radius-md, var(--lumiverse-radius));
-}
-
-.lt-btn {
-  padding: 5px 10px;
-}
-
-.lt-btn--primary {
-  background: var(--lumiverse-primary, var(--lumiverse-accent));
-  border-color: var(--lumiverse-primary, var(--lumiverse-accent));
-  color: var(--lumiverse-on-primary, var(--lumiverse-primary-contrast, var(--lumiverse-text)));
-}
-
-.lt-search,
-.lt-select,
-.lt-input {
-  background: var(--lumiverse-input-bg, var(--lumiverse-fill));
-}
-
-.lt-chip,
-.lt-badge {
-  border-radius: var(--lumiverse-radius-sm, var(--lumiverse-radius));
-}
-
-.lt-list {
-  gap: 5px;
-}
-
-.lt-tag-row,
-.lt-character-row {
-  border-radius: var(--lumiverse-radius-md, var(--lumiverse-radius));
-}
-
-.lt-tag-row:hover,
-.lt-character-row:hover {
-  background: var(--lumiverse-bg-hover, var(--lumiverse-fill-subtle));
-}
-
-.lt-tag-row--selected,
-.lt-character-row--selected {
-  border-color: var(--lumiverse-primary, var(--lumiverse-accent));
-  background: var(--lumiverse-primary-008, var(--lumiverse-fill-subtle));
-}
-
-.lt-dialog {
-  border-radius: var(--lumiverse-radius-lg, var(--lumiverse-radius));
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .lt-app *,
-  .lt-app *::before,
-  .lt-app *::after {
-    transition-duration: 0.001ms !important;
-  }
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+  padding: 8px;
+  color: var(--lumiverse-text);
+  font-size: 13px;
+  font-family: inherit;
 }
 `
