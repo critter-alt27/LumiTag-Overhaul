@@ -61,6 +61,22 @@ const ROW_LIMIT = 300
 /** Hard cap on eagerly rendered options in either tag picker. */
 const TAG_OPTION_LIMIT = 200
 
+/**
+ * How many inline tag chips a character row shows before its chips collapse.
+ *
+ * A character with fifty tags used to produce a fifty-chip wall that made the
+ * whole list unscannable; a character with one or two tags was never the
+ * problem, and hiding those behind a disclosure would just add a click to every
+ * row for no density gain. Three is the point where the chip block starts
+ * competing with the rest of the list rather than reading as part of its row:
+ * at four or more, at least one wrapped line separates a row's chips from its
+ * neighbour's, so the rows stop reading as rows.
+ *
+ * The chips are *never* hidden — they scroll, and the summary says how many
+ * there are — so this only trades a click for legibility, never for access.
+ */
+const COLLAPSE_TAGS_ABOVE = 3
+
 /** All six sort modes, in the store's canonical order. */
 const SORT_OPTIONS: readonly { value: CharacterSortMode; label: string }[] = CHARACTER_SORT_MODES.map(
   (mode) => ({ value: mode, label: CHARACTER_SORT_LABELS[mode] }),
@@ -123,6 +139,17 @@ const chipsInFlight = new Set<string>()
  * is rendered beside it so the failure is visible rather than silent.
  */
 const chipErrors = new Map<string, string>()
+
+/**
+ * Which characters' tag chips the reader has expanded, keyed by `character.id`.
+ *
+ * Module scope for the same reason as {@link chipsInFlight}: the shell rebuilds
+ * this panel on every store change, so a `<details>` element's `open` attribute
+ * would snap shut on every edit and typing a tag name would collapse the row the
+ * reader was working in. `undefined` means "never touched" — the row then falls
+ * back to the {@link COLLAPSE_TAGS_ABOVE} default.
+ */
+const tagRowsExpanded = new Map<string, boolean>()
 
 /** Session-authenticated, read-only avatar endpoint for a character. */
 function avatarUrl(id: string): string {
@@ -628,6 +655,88 @@ export function renderCharactersSection(options: {
     return node
   }
 
+  /**
+   * One character's tag chips, behind a native `<details>` that scrolls.
+   *
+   * Why a real `<details>`/`<summary>` and not a click handler on a div: the
+   * native element brings the keyboard (Enter/Space), the expanded/collapsed
+   * semantics screen readers announce, and the `open` attribute for free, and
+   * the summary's own text is the accessible name. Re-implementing that with a
+   * `tabindex`, an `aria-expanded` and a boolean would be strictly worse.
+   *
+   * The chips themselves are bounded by `max-height` + `overflow-y: auto` so
+   * that expanding a 50-tag character scrolls instead of re-creating the very
+   * wall of chips this collapse exists to remove. Scrolling rather than
+   * truncating is the point: no chip is ever unreachable, so no chip can be
+   * silently lost.
+   *
+   * Sizing is applied inline (not as a stylesheet rule) on purpose: the sheet
+   * is shared with other renderers and a class-only change here would be a
+   * cross-file edit this module does not own. The rules that make this read
+   * like the rest of the list (marker, summary colour, spacing) are reported to
+   * whoever owns `styles.ts`.
+   */
+  const renderCharacterTags = (
+    id: string,
+    displayName: string,
+    tags: readonly string[],
+    hasChipError: boolean,
+  ): HTMLElement => {
+    // The reader's explicit choice wins; a recorded failure wins over that,
+    // because a collapsed row must never be the reason a failed write looks
+    // like it succeeded. An untouched row falls back to the count threshold.
+    const remembered = tagRowsExpanded.get(id)
+    const open = hasChipError || (remembered ?? tags.length <= COLLAPSE_TAGS_ABOVE)
+
+    const details = el('details', {
+      class: 'lt-character-row__tags',
+      open: open === true,
+      'aria-label': `Tags for ${displayName}`,
+    })
+
+    const summary = el('summary', {
+      class: 'lt-character-row__tags-summary',
+      // A <summary> is natively focusable and operable from the keyboard; an
+      // explicit tabindex would only duplicate it, so the default is kept.
+      'aria-label': `${tagCountLabel(tags.length)} for ${displayName}${hasChipError ? ', with a removal that failed' : ''}`,
+    })
+    // Reuse the same count wording as the row badge rather than keeping a
+    // second source of truth: collapsed, this line IS the row's tag count.
+    summary.appendChild(el('span', { class: 'lt-badge' }, [tagCountLabel(tags.length)]))
+    if (hasChipError) {
+      // `lt-badge--accent` is the strongest existing badge emphasis; a
+      // dedicated `--error` badge is listed in the CSS report for whoever owns
+      // `styles.ts`, so this renders correctly either way.
+      summary.appendChild(el('span', { class: 'lt-badge lt-badge--accent' }, ['removal failed']))
+    }
+    // State-neutral wording: the native marker already says which way the
+    // disclosure points, and "show tags" would be a lie while it is open.
+    summary.appendChild(el('span', { class: 'lt-character-row__sub' }, ['show / hide tags']))
+    details.appendChild(summary)
+
+    // Remembering the toggle keeps the row's state across the shell's full
+    // rebuilds — without this, adding a tag elsewhere would collapse the row
+    // the reader just expanded. `track` keeps it disposable like every other
+    // listener in this file.
+    track(
+      on(details, 'toggle', () => {
+        tagRowsExpanded.set(id, details.open)
+      }),
+    )
+
+    const chips = el('div', {
+      class: 'lt-character-row__chips lt-character-row__chips--scroll',
+      // `overflow-y: auto` alone is what makes a 50-tag character a row again
+      // rather than a page; the height is a cap, so a 2-tag character is
+      // unaffected.
+      style: 'max-height: 7.5em; overflow-y: auto;',
+    })
+    for (const tag of tags) chips.appendChild(renderCharacterChip(id, displayName, tag))
+    details.appendChild(chips)
+
+    return details
+  }
+
   const renderCharacterRow = (view: StoreView, row: CharacterListRow): HTMLElement => {
     const id = row.character?.id ?? ''
     const name = row.character?.name ?? ''
@@ -668,6 +777,14 @@ export function renderCharactersSection(options: {
     title.appendChild(el('span', { class: 'lt-badge lt-badge--muted' }, [shortId(id)]))
     main.appendChild(title)
 
+    // Errors are read BEFORE the chips are built because they decide whether
+    // the row starts expanded: a failed removal must never be something the
+    // reader has to go looking for behind a collapsed disclosure.
+    const errors = tags
+      .map((tag) => chipErrors.get(chipKey(id, tag)))
+      .filter((message): message is string => typeof message === 'string' && message !== '')
+    const hasChipError = errors.length > 0
+
     if (tags.length === 0) {
       main.appendChild(
         el('p', { class: 'lt-character-row__sub' }, [
@@ -675,14 +792,13 @@ export function renderCharactersSection(options: {
         ]),
       )
     } else {
-      const chips = el('div', { class: 'lt-character-row__chips' })
-      for (const tag of tags) chips.appendChild(renderCharacterChip(id, displayName, tag))
-      main.appendChild(chips)
+      main.appendChild(renderCharacterTags(id, displayName, tags, hasChipError))
     }
 
-    const errors = tags
-      .map((tag) => chipErrors.get(chipKey(id, tag)))
-      .filter((message): message is string => typeof message === 'string' && message !== '')
+    // Deliberately OUTSIDE the <details>, and an `alert`, so a failed removal
+    // is announced and readable whether or not the chips are expanded. The chip
+    // it belongs to is still on screen (or one click away inside the scroller);
+    // nothing was hidden optimistically and nothing is hidden by this.
     for (const message of errors) {
       main.appendChild(el('p', { class: 'lt-state__detail', role: 'alert' }, [message]))
     }

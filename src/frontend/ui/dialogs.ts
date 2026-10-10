@@ -156,9 +156,14 @@ function safeMessage(error: unknown, fallback: string): string {
 /**
  * Open the in-panel overlay.
  *
- * Positions itself over `host.root` with an inline backdrop (the stylesheet
- * deliberately has no overlay class and `styles.ts` is owned elsewhere), and
- * wires the accessible dialog contract.
+ * Positions itself over `host.root` and wires the accessible dialog contract.
+ * Both the overlay and the panel are laid out entirely by the stylesheet (see
+ * the `.lt-dialog-overlay` / `.lt-dialog` rules in styles.ts). This used to
+ * inline a duplicate of every layout declaration here, which was both redundant
+ * and harmful: an inline declaration beats the stylesheet, so the stylesheet's
+ * narrow-viewport rules (tighter overlay padding, `box-sizing: border-box`)
+ * could never take effect and the panel kept its content-box width — 22px wider
+ * than the padded overlay — and ran off the right edge of a phone screen.
  */
 function openOverlay(host: DialogHost, title: string, description?: string): OverlayHandle {
   const stack = stackFor(host.root)
@@ -179,14 +184,19 @@ function openOverlay(host: DialogHost, title: string, description?: string): Ove
   const body = el('div', { class: 'lt-dialog__body' })
   const actions = el('div', { class: 'lt-dialog__actions' })
 
+  // Class only. `position`, `width: min(560px, 100%)`, `max-height`,
+  // `overflow-y`, `box-sizing: border-box` and the `100vw` cap all come from
+  // `.lt-dialog` in styles.ts. An earlier version inlined
+  // `width: min(560px, 100%)` under the default content-box sizing: the 10px
+  // padding plus 1px border were added on top of that width, so on a phone the
+  // panel rendered 22px wider than the padded overlay and was clipped off the
+  // right edge of the screen.
   const panel = el('div', {
     class: 'lt-dialog',
     role: 'dialog',
     'aria-modal': 'true',
     'aria-labelledby': titleId,
     tabindex: '-1',
-    style:
-      'position:relative;width:min(560px,100%);max-height:calc(100% - 24px);overflow-y:auto;',
   })
   panel.appendChild(el('h3', { class: 'lt-dialog__title', id: titleId }, [title]))
   if (description !== undefined && description !== '') {
@@ -196,11 +206,13 @@ function openOverlay(host: DialogHost, title: string, description?: string): Ove
   panel.appendChild(body)
   panel.appendChild(actions)
 
-  const element = el('div', {
-    class: 'lt-dialog-overlay',
-    style:
-      'position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;padding:12px;background:rgba(0,0,0,0.45);',
-  })
+  // Class only — no inline style. `.lt-dialog-overlay` in styles.ts owns the
+  // fixed positioning, the flex centring and the 12px/8px responsive padding.
+  // The hardcoded `rgba(0,0,0,0.45)` that used to live here was also
+  // theme-blind; the stylesheet composes the scrim from `--lumiverse-text`
+  // instead. Both of those inline declarations outranked the stylesheet, which
+  // is exactly why the mobile padding override could not take effect.
+  const element = el('div', { class: 'lt-dialog-overlay' })
   element.appendChild(panel)
 
   const handle: OverlayHandle = {

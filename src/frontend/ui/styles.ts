@@ -594,16 +594,91 @@ export const LUMITAG_CSS = `
   justify-content: center;
   padding: 12px;
   background: color-mix(in srgb, var(--lumiverse-text) 45%, transparent);
+  /* The overlay is the sizing context every dialog is measured against: with
+     box-sizing: border-box its 12px padding is guaranteed to be inside the
+     box, so width: 100% on the panel means "the padded content box" and the
+     panel can never spill past the scrim. Without this the padding would be
+     added to the viewport and the panel's 100% would already overflow. */
+  box-sizing: border-box;
+  /* A dialog is the tallest thing on screen; a long list must scroll inside it
+     rather than letting the overlay itself grow a scrollbar on mobile. */
+  min-width: 0;
+  overflow: hidden;
 }
 
+/*
+ * The dialog panel.
+ *
+ * Sizing lives here rather than in an inline style so it can be media-queried
+ * and reasoned about in one place. The rules that matter on a phone:
+ *
+ *  - box-sizing: border-box makes width the *outer* width. The panel has
+ *    10px padding and a 1px border on every side; under the default
+ *    content-box sizing those were added on top of the declared width, so a
+ *    width: 100% panel rendered 22px wider than its parent and ran off the
+ *    right edge of the screen.
+ *  - width: min(560px, 100%) therefore now genuinely fits the padded overlay
+ *    at every viewport, and max-width: 100vw - 24px is a belt-and-braces cap
+ *    for the case where the overlay is ever narrower than the viewport (an
+ *    embedded host panel), where percentage widths would be misleading.
+ *  - min-width: 0 lets the panel shrink below its content's intrinsic
+ *    minimum inside the flex overlay; without it a wide child (a long search
+ *    help <code> token) refuses to shrink and re-creates the overflow.
+ */
 .lt-dialog {
+  position: relative;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  width: min(560px, 100%);
+  max-width: calc(100vw - 24px);
+  max-height: calc(100% - 24px);
+  min-width: 0;
+  overflow-y: auto;
   padding: 10px;
-  border: 1px solid var(--lumiverse-accent);
-  border-radius: var(--lumiverse-radius);
-  background: var(--lumiverse-fill);
+  /* --lumiverse-accent is NOT defined by the host theme (the host ships
+     --lumiverse-primary; every use of "accent" in its own CSS carries an
+     explicit fallback), so an unfallbacked reference would leave the border
+     with an invalid colour. Chain to --lumiverse-primary, then to a system
+     colour that is always defined. */
+  border: 1px solid var(--lumiverse-accent, var(--lumiverse-primary, CanvasText));
+  border-radius: var(--lumiverse-radius, 8px);
+  /* THE OPACITY FIX. --lumiverse-fill is defined, but it is
+     rgba(0, 0, 0, 0.15) — a 15%-alpha *tint*, not a surface. Using it as
+     the panel background is what made every dialog look transparent: the page
+     behind showed straight through the dialog. A dialog has to be a real
+     surface, so this uses the host's opaque panel colours and only falls back
+     to a system colour when the host theme defines none of them.
+     Canvas is the browser's opaque document background — never transparent,
+     never partially alpha, and it follows the OS light/dark preference. */
+  background: var(
+    --lumiverse-bg-deep,
+    var(--lumiverse-bg-opaque, var(--lumiverse-card-bg-solid, Canvas))
+  );
+  /* Long unbreakable runs (search-help syntax tokens such as A:John, T:Elf
+     T:Magic, tag names, backend messages) must wrap or scroll instead of
+     widening the panel. anywhere rather than break-word because it also
+     affects the intrinsic min-content size, which is what actually pushed the
+     flex panel wider than its box. */
+  overflow-wrap: anywhere;
+}
+
+/*
+ * On a phone the overlay padding is the only gutter between the dialog and the
+ * screen edge, so it is trimmed to keep the usable panel width as large as
+ * possible. Desktop keeps the 12px breathing room from the base rule.
+ */
+@media (max-width: 640px) {
+  .lt-dialog-overlay { padding: 8px; }
+
+  .lt-dialog {
+    width: 100%;
+    /* Matches the trimmed overlay padding above; without it the 24px cap would
+       leave 8px of the dialog clipped on each side. */
+    max-width: calc(100vw - 16px);
+    max-height: calc(100% - 16px);
+  }
 }
 
 /*
@@ -620,6 +695,11 @@ export const LUMITAG_CSS = `
   flex-direction: column;
   gap: 8px;
   min-height: 0;
+  /* min-width: 0 for the same reason as on the panel: a flex item defaults to
+     min-width:auto, i.e. its content's intrinsic min-content width, so one long
+     unbreakable line would widen the body past the panel and force a horizontal
+     scrollbar on mobile. */
+  min-width: 0;
   overflow-y: auto;
 }
 
@@ -635,13 +715,27 @@ export const LUMITAG_CSS = `
   margin: 0;
   font-size: 14px;
   font-weight: 600;
-  color: var(--lumiverse-text);
+  color: var(--lumiverse-text, CanvasText);
+  overflow-wrap: anywhere;
 }
 
+/*
+ * Prose inside a dialog.
+ *
+ * These are the long help sentences and the descriptions in the search-help
+ * lists. On a narrow phone a single word can be wider than the dialog, so they
+ * wrap mid-word (anywhere also shrinks the min-content size, which is what
+ * actually stops the container growing) rather than clipping or scrolling
+ * sideways. The colour fallbacks mirror the panel's: --lumiverse-text-muted is
+ * defined by the host, but a user-authored theme that omits it should still get
+ * legible ink instead of inheriting nothing.
+ */
 .lt-dialog__desc {
   margin: 0;
   font-size: 12px;
-  color: var(--lumiverse-text-muted);
+  color: var(--lumiverse-text-muted, var(--lumiverse-text, CanvasText));
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .lt-dialog__actions {
@@ -649,22 +743,50 @@ export const LUMITAG_CSS = `
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 6px;
+  min-width: 0;
 }
 
+/*
+ * A dialog's scrollable list of lines.
+ *
+ * min-width: 0 + overflow-wrap on the container AND its children: the children
+ * are flex items, so each one also needs its own min-width: 0 or the widest
+ * line re-inflates the whole list.
+ */
 .lt-dialog__list {
   display: flex;
   flex-direction: column;
   gap: 4px;
   max-height: 240px;
+  min-width: 0;
   overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.lt-dialog__list > * { min-width: 0; }
+
+/*
+ * Search-help syntax tokens (A:John, T:Elf T:Magic) and the A:<field> rows.
+ *
+ * These are inline <code> runs with no spaces, so they are the single most
+ * likely thing to blow out a dialog on a phone. overflow-wrap: anywhere lets
+ * them break mid-token instead; max-width: 100% keeps a long token from
+ * establishing an overflow contribution larger than the panel.
+ */
+.lt-dialog code,
+.lt-dialog__list code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-width: 100%;
 }
 
 .lt-dialog__summary {
   font-size: 12px;
-  color: var(--lumiverse-text-muted);
+  color: var(--lumiverse-text-muted, var(--lumiverse-text, CanvasText));
+  overflow-wrap: anywhere;
 }
 
-.lt-dialog__summary strong { color: var(--lumiverse-text); }
+.lt-dialog__summary strong { color: var(--lumiverse-text, CanvasText); }
 
 /* ------------------------------------------------------------------ */
 /* Sticky failure report panel                                         */

@@ -13,6 +13,15 @@
  * render would leak one listener per keystroke. Instead the shell keeps a
  * single set of disposers, rebuilds them on each render, and tears the previous
  * set down first. `destroy()` clears them and empties the root.
+ *
+ * ## Scroll preservation
+ *
+ * The shell REBUILDS the whole subtree on every commit, and the scrolling
+ * container (`.lt-app__body`) is part of that subtree — so the browser starts
+ * each render from `scrollTop === 0`. That is the "it jumps back to the top of
+ * the tab when I open a tag" report: `toggleTagExpanded` commits, the list is
+ * replaced, and the offset is gone. See `restoreScroll` in `render()` for how
+ * the offset is carried across.
  */
 
 import type { TagManagerStore, StoreView } from '../store'
@@ -90,6 +99,8 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
   let disposers: (() => void)[] = []
   let destroyed = false
   let lastVersion = -1
+  /** Section shown by the PREVIOUS render, so a tab switch can reset the scroll. */
+  let lastSection: StoreView['section'] | null = null
 
   /** Container refs, recreated each render so listeners die with the DOM. */
   let sectionHost: HTMLElement | null = null
@@ -113,6 +124,22 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     disposers = []
   }
 
+  /**
+   * Put `body` back at `top`, clamped to what it can actually hold.
+   *
+   * Assigning a `scrollTop` past the end of the content is silently coerced to
+   * the maximum by the engine, so the raw value looks "restored" in a debug
+   * read while the user is silently parked somewhere they never asked for. The
+   * case is real here — a narrower filter, a collapsed row, or a panel-level
+   * error state can all leave the new content shorter than the old — so the
+   * clamp is explicit rather than left to the browser.
+   */
+  const restoreScroll = (top: number, body: HTMLElement): void => {
+    if (top <= 0) return
+    const max = Math.max(0, body.scrollHeight - body.clientHeight)
+    body.scrollTop = Math.min(top, max)
+  }
+
   const render = (): void => {
     if (destroyed) return
     const view = store.view
@@ -122,10 +149,37 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     if (store.version === lastVersion) return
     lastVersion = store.version
 
+    // Read the offset off the PREVIOUS render's body, before `clear()` throws
+    // that element away: the replacement starts life at 0 and there is no
+    // browser-level memory of where the user was.
+    //
+    // A plain offset — not an anchor on the expanded row — is the right unit
+    // here, and deliberately so. The expanded character sub-list is inserted
+    // immediately AFTER its own row, so nothing above the row the user clicked
+    // changes height and preserving the raw offset leaves that row at exactly
+    // the pixel it was on. Anchoring would only add a second thing that can be
+    // computed wrongly (a stale `offsetTop` from the torn-down tree) to arrive
+    // at the same answer.
+    const previousTop = sectionHost !== null ? sectionHost.scrollTop : 0
+
+    // Switching tabs replaces the content wholesale with something unrelated,
+    // so the offset from the previous tab is meaningless there and the new tab
+    // should start at its own top. Every OTHER re-render — filtering, sorting,
+    // expanding, selecting in bulk/merge mode — keeps the offset.
+    const switchedSection = lastSection !== null && lastSection !== view.section
+    lastSection = view.section
+
     teardownListeners()
     clear(root)
 
     const app = el('div', { class: 'lt-app' })
+
+    // Attach before the children are built, not after. The sections and the
+    // failure panel restore focus into their freshly built controls, and
+    // `focus()` on a detached subtree is a no-op — attaching first is what
+    // makes that restoration (search caret on every keystroke) actually work.
+    root.appendChild(app)
+
     app.appendChild(renderHeader(view))
     app.appendChild(renderTabs(view))
     app.appendChild(renderMeta(view))
@@ -138,7 +192,9 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     app.appendChild(failureHost)
     options.renderFailurePanel(failureHost)
 
-    root.appendChild(app)
+    // The body is populated and attached now, so `scrollHeight` is meaningful
+    // and the clamp can be computed rather than guessed.
+    if (!switchedSection && sectionHost !== null) restoreScroll(previousTop, sectionHost)
   }
 
   const renderHeader = (view: StoreView): HTMLElement => {
@@ -313,6 +369,7 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     failureHost = null
     refreshButton = null
     searchHelpButton = null
+    lastSection = null
     clear(root)
   }
 

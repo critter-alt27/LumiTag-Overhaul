@@ -10,5 +10,5 @@ coverage/
 # guard for the host app). LumiTag's markdown deliverables must ship with the
 # extension, so re-include them. A .gitignore in a deeper directory takes
 # precedence over shallower patterns.
-!DEVELOPMENT_NOTES.md
+DEVELOPMENT_NOTES.md
 !README.md
