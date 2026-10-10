@@ -15,15 +15,6 @@
 
 export const LUMITAG_CSS = `
 /* ------------------------------------------------------------------ */
- /* Native Lumiverse theme bridge                                        */
- /* ------------------------------------------------------------------ */
-.lt-app,
-.lt-dialog-overlay {
-  --lumiverse-accent: var(--lumiverse-primary, #9370db);
-  --lumiverse-accent-fg: var(--lumiverse-primary-deep-contrast, #f8f5ff);
-}
-
-/* ------------------------------------------------------------------ */
 /* Screen-reader-only text                                             */
 /* ------------------------------------------------------------------ */
 .lt-visually-hidden {
@@ -45,14 +36,11 @@ export const LUMITAG_CSS = `
 .lt-app {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   height: 100%;
   min-height: 0;
-  padding: 10px;
+  padding: 8px;
   color: var(--lumiverse-text);
-  background: transparent;
-  font-family: var(--lumiverse-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
-  line-height: 1.45;
   font-size: 13px;
 }
 
@@ -65,9 +53,8 @@ export const LUMITAG_CSS = `
 
 .lt-app__title {
   margin: 0;
-  font-size: 16px;
-  letter-spacing: -0.02em;
-  font-weight: 650;
+  font-size: 15px;
+  font-weight: 600;
   color: var(--lumiverse-text);
 }
 
@@ -102,21 +89,20 @@ export const LUMITAG_CSS = `
 .lt-tabs {
   display: flex;
   align-items: stretch;
-  gap: 5px;
-  border-bottom: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.12));
-  padding: 0 0 7px;
-  flex-shrink: 0;
+  gap: 4px;
+  border-bottom: 1px solid var(--lumiverse-border);
+  padding-bottom: 4px;
 }
 
 .lt-tab {
   appearance: none;
   border: 1px solid transparent;
-  border-radius: var(--lumiverse-radius-md, 10px);
+  border-radius: var(--lumiverse-radius);
   background: transparent;
   color: var(--lumiverse-text-muted);
   font: inherit;
-  font-weight: 550;
-  padding: 7px 13px;
+  font-weight: 500;
+  padding: 5px 12px;
   cursor: pointer;
   transition: background-color var(--lumiverse-transition-fast),
     color var(--lumiverse-transition-fast);
@@ -128,10 +114,9 @@ export const LUMITAG_CSS = `
 }
 
 .lt-tab[aria-selected="true"] {
-  background: var(--lumiverse-primary-015, rgba(147, 112, 219, 0.15));
-  color: var(--lumiverse-primary-text, #ba87ff);
-  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.25));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  background: var(--lumiverse-accent);
+  color: var(--lumiverse-accent-fg);
+  border-color: var(--lumiverse-accent);
 }
 
 .lt-tab:focus-visible {
@@ -196,14 +181,12 @@ export const LUMITAG_CSS = `
   align-items: center;
   gap: 4px;
   border: 1px solid var(--lumiverse-border);
-  border-radius: var(--lumiverse-radius-md, 10px);
-  background: var(--lumiverse-bg-elevated, var(--lumiverse-fill));
+  border-radius: var(--lumiverse-radius);
+  background: var(--lumiverse-fill);
   color: var(--lumiverse-text);
   font: inherit;
-  line-height: 1.25;
-  font-weight: 550;
-  padding: 6px 11px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  line-height: 1.2;
+  padding: 4px 10px;
   cursor: pointer;
   transition: background-color var(--lumiverse-transition-fast),
     border-color var(--lumiverse-transition-fast),
@@ -226,10 +209,9 @@ export const LUMITAG_CSS = `
 }
 
 .lt-btn--primary {
-  background: linear-gradient(135deg, var(--lumiverse-primary-hover, #a784ef), var(--lumiverse-primary, #9370db));
-  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.5));
-  color: var(--lumiverse-primary-deep-contrast, #f8f5ff);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  background: var(--lumiverse-accent);
+  border-color: var(--lumiverse-accent);
+  color: var(--lumiverse-accent-fg);
 }
 
 .lt-btn--danger {
@@ -262,12 +244,11 @@ export const LUMITAG_CSS = `
   width: 100%;
   box-sizing: border-box;
   border: 1px solid var(--lumiverse-border);
-  border-radius: var(--lumiverse-radius-md, 10px);
-  background: var(--lumiverse-input-bg, var(--lumiverse-fill));
+  border-radius: var(--lumiverse-radius);
+  background: var(--lumiverse-fill);
   color: var(--lumiverse-text);
   font: inherit;
-  padding: 7px 10px;
-  min-height: 34px;
+  padding: 4px 8px;
   transition: border-color var(--lumiverse-transition-fast);
 }
 
@@ -414,10 +395,10 @@ export const LUMITAG_CSS = `
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 7px 10px;
-  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.12));
-  border-radius: var(--lumiverse-radius-md, 10px);
-  background: var(--lumiverse-bg-040, var(--lumiverse-fill));
+  padding: 5px 8px;
+  border: 1px solid var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius);
+  background: var(--lumiverse-fill);
   transition: background-color var(--lumiverse-transition-fast),
     border-color var(--lumiverse-transition-fast);
 }
@@ -500,10 +481,10 @@ export const LUMITAG_CSS = `
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 8px 10px;
-  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.12));
-  border-radius: var(--lumiverse-radius-md, 10px);
-  background: var(--lumiverse-bg-040, var(--lumiverse-fill));
+  padding: 6px 8px;
+  border: 1px solid var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius);
+  background: var(--lumiverse-fill);
   transition: background-color var(--lumiverse-transition-fast),
     border-color var(--lumiverse-transition-fast);
 }
@@ -1280,61 +1261,3 @@ export const LUMITAG_CSS = `
   }
 }
 `
-/* Final surface polish: subtle Lumiverse glass, clear hover feedback, and
-   compact layouts that remain usable in narrow extension drawers. */
-.lt-app__header {
-  padding: 2px 1px 4px;
-}
-.lt-toolbar {
-  padding: 9px;
-  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.12));
-  border-radius: var(--lumiverse-radius-lg, 12px);
-  background: var(--lcs-glass-bg, var(--lumiverse-bg-040, rgba(18, 16, 28, 0.55)));
-}
-.lt-toolbar__actions {
-  gap: 5px;
-}
-.lt-btn,
-.lt-tab,
-.lt-tag-row,
-.lt-character-row,
-.lt-chip,
-.lt-search,
-.lt-select,
-.lt-input {
-  transition:
-    background-color var(--lumiverse-transition-fast, 150ms ease),
-    border-color var(--lumiverse-transition-fast, 150ms ease),
-    color var(--lumiverse-transition-fast, 150ms ease),
-    box-shadow var(--lumiverse-transition-fast, 150ms ease),
-    transform var(--lumiverse-transition-fast, 150ms ease);
-}
-.lt-tag-row:hover,
-.lt-character-row:hover {
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
-}
-.lt-btn--primary:hover:not(:disabled) {
-  filter: brightness(1.07);
-}
-.lt-search:focus-visible,
-.lt-select:focus-visible,
-.lt-input:focus-visible {
-  box-shadow: 0 0 0 3px var(--lumiverse-primary-010, rgba(147, 112, 219, 0.1));
-}
-.lt-chip {
-  border-radius: var(--lumiverse-radius-sm, 5px);
-}
-.lt-badge {
-  border-radius: var(--lumiverse-radius-sm, 5px);
-}
-@media (max-width: 520px) {
-  .lt-app { padding: 7px; gap: 8px; }
-  .lt-toolbar { padding: 7px; }
-  .lt-toolbar__grow { flex-basis: 100%; min-width: 0; }
-  .lt-toolbar__actions { width: 100%; }
-  .lt-toolbar__actions .lt-btn { flex: 1 1 auto; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .lt-btn, .lt-tab, .lt-tag-row, .lt-character-row, .lt-chip,
-  .lt-search, .lt-select, .lt-input { transition: none; }
-}
