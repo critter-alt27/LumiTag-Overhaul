@@ -542,6 +542,68 @@ export const LUMITAG_CSS = `
   min-width: 0;
 }
 
+/* A row's tags behind their native <details> disclosure. The min-width: 0 is
+   load-bearing: the row's __main is a flex child, and without it a long
+   unbroken tag name could stretch the disclosure past the row instead of
+   wrapping or ellipsising inside it. */
+.lt-character-row__tags {
+  min-width: 0;
+  margin-top: 4px;
+}
+
+/* Deliberately NOT display: flex.
+   In Chromium a flex <summary> drops its native disclosure triangle, and that
+   triangle is the one thing telling a closed row from an open one at a glance:
+   it rotates for free, needs no extra element, and is what the browser's own
+   accessibility tree already associates with the disclosure. Measured at
+   360x640: a flex summary renders open and closed byte-identically, so the row
+   reads as static text; the list-item default below rotates as expected.
+   So the summary keeps its UA list-item display for the marker, and children
+   are spaced with a sibling margin rather than a flex gap -- the badges are
+   inline-flex already, so they lay out correctly in a list-item. */
+.lt-character-row__tags-summary {
+  cursor: pointer;
+  color: var(--lumiverse-text-dim, var(--lumiverse-text-muted, CanvasText));
+  font-size: 11px;
+}
+
+/* Tints the native marker to match the summary text instead of letting it
+   render as an unthemed black triangle against the dark panel surface. */
+.lt-character-row__tags-summary::marker {
+  color: var(--lumiverse-text-dim, var(--lumiverse-text-muted, CanvasText));
+}
+
+.lt-character-row__tags-summary > * + * {
+  margin-left: 6px;
+}
+
+.lt-character-row__tags-summary:hover {
+  color: var(--lumiverse-text-muted);
+}
+
+/* The .lt-app-wide :focus-visible rule already draws an outline, but it names
+   --lumiverse-accent, which the host does not define (it ships
+   --lumiverse-primary), so the global outline resolves to nothing usable.
+   Spelling the accent out with fallbacks here is what actually gives keyboard
+   users a visible focus ring on the disclosure. */
+.lt-character-row__tags-summary:focus-visible {
+  outline: 2px solid var(--lumiverse-accent, var(--lumiverse-primary, CanvasText));
+  outline-offset: 2px;
+  border-radius: var(--lumiverse-radius, 8px);
+}
+
+/* The chips cap: a 50-tag character scrolls inside its own row instead of
+   becoming a page-long chip wall again. This was inline styling before; as a
+   class it is overridable and testable. 7.5em resolves against the container's
+   own font-size (~13px => ~97px), so it tracks the user's font scale rather
+   than being a fixed pixel count. The overscroll-behavior stops a flick that
+   reaches the end of the chip list from then scrolling the panel behind it. */
+.lt-character-row__chips--scroll {
+  max-height: 7.5em;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 /* ------------------------------------------------------------------ */
 /* Badges                                                              */
 /* ------------------------------------------------------------------ */
@@ -576,7 +638,7 @@ export const LUMITAG_CSS = `
 /* ------------------------------------------------------------------ */
 
 /*
- * The backdrop behind an in-panel dialog.
+ * The backdrop behind a dialog.
  *
  * It is a fixed, full-viewport layer with a real background rather than a
  * hardcoded rgba, so the scrim tracks the host theme. The colour itself is
@@ -584,16 +646,45 @@ export const LUMITAG_CSS = `
  * ink the theme offers, so fading it out is theme-safe in both light and dark.
  * animation is not used here — the overlay must appear instantly so a dialog
  * never flashes in late.
+ *
+ * This element is mounted on document.body (see portalParent in dialogs.ts),
+ * NOT inside the app panel, and that is a load-bearing decision rather than
+ * cosmetic:
+ *
+ *  - A "position: fixed" element is sized against its CONTAINING BLOCK, which
+ *    per CSS becomes the nearest ancestor with a transform, will-change,
+ *    filter, backdrop-filter, "contain: layout|paint", or "isolation: isolate".
+ *    The host's drawer panel has all of those, so an overlay appended into it
+ *    resolved "inset: 0" against the 320px drawer instead of the 360px
+ *    viewport: the dialog was centred in the overlay and 20px right of centre
+ *    on screen. On document.body there is no such ancestor and "inset: 0" is
+ *    genuinely the viewport. Never re-parent this back into .lt-app.
+ *
+ * (This file is a template literal, hence the quoted CSS instead of backticks.)
+ *
+ * Because it is no longer inside .lt-app, the two inherited things it used to
+ * get from there are restated below (typography and the generic focus ring).
+ *
+ * z-index: the overlay now competes at the top level of the document rather
+ * than inside the drawer's stacking context. It has to out-rank the drawer
+ * itself (z-index 9992 in Lumiverse ViewportDrawer.module.css) or the dialog
+ * would be painted underneath the panel it was opened from. 10000 sits above
+ * that and above the drawer's tab handle (9991), while still staying below the
+ * host's own modal layer (10002+) and its toasts (10010), so a native Lumiverse
+ * dialog opened on top of ours still wins — which is what a user expects.
  */
 .lt-dialog-overlay {
   position: fixed;
   inset: 0;
-  z-index: 900;
+  z-index: 10000;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 12px;
-  background: color-mix(in srgb, var(--lumiverse-text) 45%, transparent);
+  /* --lumiverse-text is only inherited by overlays inside a themed ancestor.
+     The CanvasText fallback keeps the scrim legible if a host scopes its theme
+     variables to a subtree instead of :root. */
+  background: color-mix(in srgb, var(--lumiverse-text, CanvasText) 45%, transparent);
   /* The overlay is the sizing context every dialog is measured against: with
      box-sizing: border-box its 12px padding is guaranteed to be inside the
      box, so width: 100% on the panel means "the padded content box" and the
@@ -604,6 +695,24 @@ export const LUMITAG_CSS = `
      rather than letting the overlay itself grow a scrollbar on mobile. */
   min-width: 0;
   overflow: hidden;
+  /* Restated from .lt-app, which the overlay is no longer a descendant of, so
+     dialog typography does not silently change with the host's body font. */
+  color: var(--lumiverse-text, CanvasText);
+  font-size: 13px;
+}
+
+/*
+ * The focus ring for anything inside a dialog.
+ *
+ * ".lt-app :focus-visible" covers everything in the panel; the overlay sits
+ * outside .lt-app now, so the same rule is restated here rather than letting
+ * a dialog's focusable element lose its only outline. (Per-component rules
+ * such as ".lt-btn:focus-visible" already cover most controls; this is the
+ * catch-all for anything that is not one of them.)
+ */
+.lt-dialog-overlay :focus-visible {
+  outline: 2px solid var(--lumiverse-accent, var(--lumiverse-primary, CanvasText));
+  outline-offset: 2px;
 }
 
 /*
@@ -1071,9 +1180,17 @@ export const LUMITAG_CSS = `
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* .lt-dialog-overlay is mounted on document.body rather than inside
+     .lt-app (see the containing-block note above), so it needs its own copy of
+     this rule — otherwise dialog controls keep animating for a user who asked
+     the OS for less motion. */
   .lt-app *,
   .lt-app *::before,
-  .lt-app *::after {
+  .lt-app *::after,
+  .lt-dialog-overlay,
+  .lt-dialog-overlay *,
+  .lt-dialog-overlay *::before,
+  .lt-dialog-overlay *::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;

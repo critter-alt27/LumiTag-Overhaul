@@ -230,14 +230,6 @@ export function renderTagsSection(options: {
       actions.appendChild(toggle)
     }
 
-    actions.appendChild(
-      button('? Search syntax', {
-        variant: 'ghost',
-        title: 'Show the search syntax accepted in this section',
-        ariaLabel: 'Show search syntax help for the tags section',
-        onClick: () => requestDialog({ kind: 'search_help', context: 'tags' }),
-      }),
-    )
     bar.appendChild(actions)
 
     if (view.tagMode !== 'normal') {

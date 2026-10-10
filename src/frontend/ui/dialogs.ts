@@ -26,6 +26,14 @@
  * labelled by its own title, traps Tab, closes on Escape, and returns focus to
  * whatever opened it. At most {@link MAX_STACKED} overlays exist at once — the
  * oldest is closed when a third is requested, mirroring the host's own limit.
+ *
+ * ## Where a dialog is mounted
+ *
+ * On `document.body`, never inside the host's drawer tab panel. A transformed,
+ * isolated or contained ancestor becomes the containing block for its
+ * `position: fixed` descendants, so an in-drawer overlay sized itself against
+ * the drawer instead of the viewport and every dialog rendered visibly
+ * off-centre on a phone. See {@link portalParent}.
  */
 
 import { classifyError } from '../mutations/executor'
@@ -90,7 +98,15 @@ interface OverlayHandle {
   close(): void
 }
 
-/** Per-root overlay stacks, so two tabs cannot fight over one global list. */
+/**
+ * Per-root overlay stacks, so two tabs cannot fight over one global list.
+ *
+ * The key is still `host.root` even though overlays no longer live there: it is
+ * the *logical* owner of the dialogs, and the stack is what keeps the
+ * MAX_STACKED cap per tab rather than global. Keying it on the portal parent
+ * instead would let one extension instance's third dialog close another
+ * instance's dialog.
+ */
 const stacks = new WeakMap<HTMLElement, OverlayHandle[]>()
 
 function stackFor(root: HTMLElement): OverlayHandle[] {
@@ -103,42 +119,50 @@ function stackFor(root: HTMLElement): OverlayHandle[] {
 }
 
 /**
- * The shell owns `host.root` and empties it on every store change.
+ * Where an overlay is mounted: the document body, NOT `host.root`.
  *
- * A dialog that lived only in the DOM would therefore be wiped by any unrelated
- * store change — typing in the search box mid-dialog would close it. Rather
- * than ask the shell to carve out a portal (which it does not offer), each
- * overlay is re-appended whenever the shell drops it. The DOM nodes and their
- * state (field values, selection, validation messages) are untouched by the
- * move, so the dialog simply survives the re-render.
+ * ## Why this is not "the dialog container the host gave us"
+ *
+ * `.lt-dialog-overlay` is `position: fixed; inset: 0`, and its whole job is to
+ * cover the viewport so the dialog lands in the middle of the SCREEN. That only
+ * holds while the overlay's containing block is the viewport.
+ *
+ * Per CSS, an ancestor with `transform`, `will-change: transform`, `filter`,
+ * `contain: layout|paint`, `backdrop-filter`, or `isolation: isolate` BECOMES
+ * the containing block for its `position: fixed` descendants — `inset: 0`
+ * then resolves against that ancestor's box, not the viewport. The host's
+ * drawer panel is exactly such an ancestor (Lumiverse
+ * `ViewportDrawer.module.css`: `transition: transform …` on the drawer root,
+ * `transform: translateX(…)` on the panel, `isolation: isolate` on `.drawer`),
+ * and `host.root` — the drawer tab panel we were handed — sits inside it.
+ *
+ * So `inset: 0` resolved against a 320px-wide drawer in a 360px viewport and
+ * the overlay measured `left: 40 → right: 360`. The dialog was perfectly
+ * centred INSIDE that overlay and still 20px right of centre on screen. That is
+ * why a round of width/`box-sizing` fixes could never cure it: they were
+ * correct, but the fault was the containing block, not the size.
+ *
+ * Appending to `document.body` puts the overlay outside every transformed,
+ * isolated or contained host wrapper, so `inset: 0` really is the viewport.
+ *
+ * ## Why that also removed the remount machinery
+ *
+ * The shell owns `host.root` and empties it on every store change, which used
+ * to wipe an open dialog on any unrelated re-render (typing in the search box
+ * mid-dialog closed it). The old workaround re-appended the overlay into
+ * `host.root` from a store subscription — which is precisely what dragged it
+ * back into the drawer's containing block and produced the off-centre dialog.
+ * Mounting on `document.body` fixes both problems at once: the shell does not
+ * own `document.body`, so the overlay survives re-renders for free and no
+ * subscription (and no observer fighting a reparent) is needed at all.
+ *
+ * DO NOT "simplify" this back to `host.root.appendChild(element)`, and do not
+ * reintroduce a store-subscription remount: they undo the fix.
  */
-const remounts = new WeakMap<HTMLElement, () => void>()
-
-/** Subscribe to the store for as long as `host.root` has an open overlay. */
-function ensureRemount(host: DialogHost): void {
-  if (remounts.has(host.root)) return
-  let unsubscribe: (() => void) | null = null
-  try {
-    unsubscribe = host.store.subscribe(() => {
-      const root = host.root
-      for (const overlay of [...stackFor(root)]) {
-        if (overlay.element.parentNode !== root) root.appendChild(overlay.element)
-      }
-      // Nothing open: release the subscription rather than leaking it.
-      if (stackFor(root).length === 0 && unsubscribe !== null) {
-        unsubscribe()
-        unsubscribe = null
-        remounts.delete(root)
-      }
-    })
-  } catch {
-    // A store without subscribe simply loses the remount; the dialog still works
-    // until the shell re-renders.
-  }
-  remounts.set(host.root, () => {
-    if (unsubscribe !== null) unsubscribe()
-    remounts.delete(host.root)
-  })
+function portalParent(host: DialogHost): HTMLElement {
+  // `ownerDocument` rather than the bare `document`: the overlay must be
+  // mounted in the document the host root actually lives in.
+  return host.root.ownerDocument.body
 }
 
 let titleSeq = 0
@@ -156,7 +180,10 @@ function safeMessage(error: unknown, fallback: string): string {
 /**
  * Open the in-panel overlay.
  *
- * Positions itself over `host.root` and wires the accessible dialog contract.
+ * Positions itself over the VIEWPORT and wires the accessible dialog contract.
+ * It is mounted on `document.body`, not on `host.root` — {@link portalParent}
+ * explains the transformed-ancestor containing-block trap that makes an
+ * in-drawer mount render off-centre.
  * Both the overlay and the panel are laid out entirely by the stylesheet (see
  * the `.lt-dialog-overlay` / `.lt-dialog` rules in styles.ts). This used to
  * inline a duplicate of every layout declaration here, which was both redundant
@@ -298,9 +325,10 @@ function openOverlay(host: DialogHost, title: string, description?: string): Ove
     }),
   )
 
-  host.root.appendChild(element)
+  // Mounted on document.body, NOT on host.root — see {@link portalParent} for
+  // the transformed-ancestor containing-block trap that makes this mandatory.
+  portalParent(host).appendChild(element)
   stack.push(handle)
-  ensureRemount(host)
   const focusTarget = panel.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)
   if (focusTarget !== null) focusTarget.focus()
   else panel.focus()
@@ -377,7 +405,12 @@ async function requestConfirm(
       // Dismissed by Escape or the scrim: that is a cancel, never a confirm.
       if (!fallback.element.isConnected) settle(false)
     })
-    observer.observe(host.root, { childList: true })
+    // Watch the PORTAL, not `host.root`. The overlay is mounted on document.body
+    // (see portalParent), so a childList change in the drawer tab root says
+    // nothing about whether it is still open — and must NOT be read as a
+    // dismissal, or every unrelated re-render would silently cancel the
+    // confirm.
+    observer.observe(portalParent(host), { childList: true })
     setActions(
       fallback,
       button('Cancel', {
@@ -1309,8 +1342,10 @@ export function installDialogHost(host: DialogHost): () => void {
     if (disposed) return
     disposed = true
     // Closing every overlay first means no listener or node outlives the host.
+    // The overlays are mounted on document.body (see portalParent), not under
+    // host.root, so this disposer is the ONLY thing that takes them off the
+    // page — it must not be skipped.
     for (const overlay of [...stackFor(host.root)]) overlay.close()
-    remounts.get(host.root)?.()
     // Clearing with a no-op is safe: `requestDialog` no-ops without an opener.
     setDialogOpener(() => {})
   }

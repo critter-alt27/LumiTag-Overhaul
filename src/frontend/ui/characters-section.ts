@@ -340,17 +340,6 @@ export function renderCharactersSection(options: {
       ),
     )
 
-    const actions = el('div', { class: 'lt-toolbar__actions' })
-    actions.appendChild(
-      button('? Search syntax', {
-        variant: 'ghost',
-        title: 'Show the search syntax accepted in this section',
-        ariaLabel: 'Show search syntax help for the characters section',
-        onClick: () => requestDialog({ kind: 'search_help', context: 'characters' }),
-      }),
-    )
-    bar.appendChild(actions)
-
     return bar
   }
 
@@ -381,7 +370,7 @@ export function renderCharactersSection(options: {
     box.appendChild(
       text(
         ' Nothing has been changed; the list below is the last valid search. Narrow the query or ' +
-          'open “? Search syntax” for the accepted syntax.',
+          'open “Search Syntax Help” at the top for the accepted syntax.',
       ),
     )
     return box
@@ -670,11 +659,12 @@ export function renderCharactersSection(options: {
    * truncating is the point: no chip is ever unreachable, so no chip can be
    * silently lost.
    *
-   * Sizing is applied inline (not as a stylesheet rule) on purpose: the sheet
-   * is shared with other renderers and a class-only change here would be a
-   * cross-file edit this module does not own. The rules that make this read
-   * like the rest of the list (marker, summary colour, spacing) are reported to
-   * whoever owns `styles.ts`.
+   * Sizing and the disclosure's appearance are stylesheet rules
+   * (`.lt-character-row__tags`, `__tags-summary`, `__chips--scroll` in
+   * `styles.ts`) rather than inline styles. The summary stays a UA-default
+   * `list-item` rather than a flex row on purpose: a flex <summary> loses its
+   * native disclosure triangle in Chromium, which is what tells a closed row
+   * from an open one at a glance.
    */
   const renderCharacterTags = (
     id: string,
@@ -726,10 +716,11 @@ export function renderCharactersSection(options: {
 
     const chips = el('div', {
       class: 'lt-character-row__chips lt-character-row__chips--scroll',
-      // `overflow-y: auto` alone is what makes a 50-tag character a row again
-      // rather than a page; the height is a cap, so a 2-tag character is
-      // unaffected.
-      style: 'max-height: 7.5em; overflow-y: auto;',
+      // The height cap and `overflow-y: auto` live in `.lt-character-row__chips--scroll`
+      // in styles.ts: `overflow-y: auto` is what makes a 50-tag character a row
+      // again rather than a page, and the height is only a cap, so a 2-tag
+      // character is unaffected. A class rather than an inline style so it is
+      // overridable and assertable.
     })
     for (const tag of tags) chips.appendChild(renderCharacterChip(id, displayName, tag))
     details.appendChild(chips)

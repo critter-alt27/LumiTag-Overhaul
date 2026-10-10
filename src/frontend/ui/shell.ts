@@ -107,7 +107,6 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
   let failureHost: HTMLElement | null = null
   let refreshButton: HTMLButtonElement | null = null
   let tabButtons: HTMLButtonElement[] = []
-  let searchHelpButton: HTMLButtonElement | null = null
 
   const track = (dispose: () => void): void => {
     disposers.push(dispose)
@@ -203,10 +202,10 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     header.appendChild(el('h2', { class: 'lt-app__title' }, ['LumiTag']))
 
     header.appendChild(
-      button('Search help', {
+      button('Search Syntax Help', {
         variant: 'ghost',
         ariaLabel: 'Show search syntax help',
-        title: 'Search syntax help',
+        title: 'Show the search syntax accepted in this section',
         onClick: () => options.onShowSearchHelp(view.section),
       }),
     )
@@ -301,18 +300,6 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
       el('span', {}, [text(`Last refreshed: ${formatTime(view.lastRefreshedAt)}`)]),
     )
 
-    // Search help lives here as well as in the header so it is reachable from
-    // the keyboard without tabbing back up through the toolbar.
-    const help = button('? Search syntax', {
-      variant: 'ghost',
-      ariaLabel: `Show search syntax help for the ${view.section} section`,
-      onClick: () => options.onShowSearchHelp(view.section),
-    })
-    meta.appendChild(el('span', { class: 'lt-app__spacer' }))
-    meta.appendChild(help)
-    searchHelpButton = help
-    void searchHelpButton
-
     return meta
   }
 
@@ -368,7 +355,6 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     sectionHost = null
     failureHost = null
     refreshButton = null
-    searchHelpButton = null
     lastSection = null
     clear(root)
   }
