@@ -1260,4 +1260,103 @@ export const LUMITAG_CSS = `
     border-left-width: 5px;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Lumiverse-native polish                                             */
+/* Kept as a final, scoped override layer so existing component logic   */
+/* and the original stylesheet remain untouched.                       */
+/* ------------------------------------------------------------------ */
+.lt-app,
+.lt-dialog-overlay {
+  --lumiverse-accent: var(--lumiverse-primary, var(--lumiverse-accent));
+  --lumiverse-accent-fg: var(--lumiverse-on-primary, var(--lumiverse-primary-contrast, var(--lumiverse-text)));
+}
+
+.lt-app {
+  font-family: var(--lumiverse-font-family, inherit);
+  gap: 10px;
+}
+
+.lt-app__header {
+  padding-bottom: 2px;
+}
+
+.lt-app__title {
+  letter-spacing: -0.015em;
+}
+
+.lt-tabs {
+  gap: 3px;
+  padding-bottom: 0;
+}
+
+.lt-tab {
+  border-radius: var(--lumiverse-radius-md, var(--lumiverse-radius));
+  padding: 6px 12px;
+}
+
+.lt-tab[aria-selected="true"] {
+  border-color: transparent;
+  box-shadow: inset 0 -2px 0 var(--lumiverse-primary, var(--lumiverse-accent));
+}
+
+.lt-btn,
+.lt-search,
+.lt-select,
+.lt-input {
+  border-radius: var(--lumiverse-radius-md, var(--lumiverse-radius));
+}
+
+.lt-btn {
+  padding: 5px 10px;
+}
+
+.lt-btn--primary {
+  background: var(--lumiverse-primary, var(--lumiverse-accent));
+  border-color: var(--lumiverse-primary, var(--lumiverse-accent));
+  color: var(--lumiverse-on-primary, var(--lumiverse-primary-contrast, var(--lumiverse-text)));
+}
+
+.lt-search,
+.lt-select,
+.lt-input {
+  background: var(--lumiverse-input-bg, var(--lumiverse-fill));
+}
+
+.lt-chip,
+.lt-badge {
+  border-radius: var(--lumiverse-radius-sm, var(--lumiverse-radius));
+}
+
+.lt-list {
+  gap: 5px;
+}
+
+.lt-tag-row,
+.lt-character-row {
+  border-radius: var(--lumiverse-radius-md, var(--lumiverse-radius));
+}
+
+.lt-tag-row:hover,
+.lt-character-row:hover {
+  background: var(--lumiverse-bg-hover, var(--lumiverse-fill-subtle));
+}
+
+.lt-tag-row--selected,
+.lt-character-row--selected {
+  border-color: var(--lumiverse-primary, var(--lumiverse-accent));
+  background: var(--lumiverse-primary-008, var(--lumiverse-fill-subtle));
+}
+
+.lt-dialog {
+  border-radius: var(--lumiverse-radius-lg, var(--lumiverse-radius));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lt-app *,
+  .lt-app *::before,
+  .lt-app *::after {
+    transition-duration: 0.001ms !important;
+  }
+}
 `
