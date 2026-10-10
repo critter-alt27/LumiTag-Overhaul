@@ -604,6 +604,61 @@ export const LUMITAG_CSS = `
   overscroll-behavior: contain;
 }
 
+/* The bulk tag picker's disclosure. Same reasoning as
+   .lt-character-row__tags above, at panel scale: the picker renders up to 200
+   checkbox rows, so collapsed it must collapse to a summary line rather than
+   to 200 rows of "there is nothing here". */
+.lt-tag-picker {
+  min-width: 0;
+  margin-top: 8px;
+}
+
+/* Deliberately NOT display: flex -- same Chromium reason as the character-row
+   summary: a flex <summary> drops the native disclosure triangle, which is the
+   only cue telling a closed picker from an open one at a glance. Keeps the UA
+   list-item display and spaces children with a sibling margin instead. */
+.lt-tag-picker__summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--lumiverse-text-dim, var(--lumiverse-text-muted, CanvasText));
+}
+
+.lt-tag-picker__summary::marker {
+  color: var(--lumiverse-text-dim, var(--lumiverse-text-muted, CanvasText));
+}
+
+.lt-tag-picker__summary > * + * {
+  margin-left: 6px;
+}
+
+.lt-tag-picker__summary:hover {
+  color: var(--lumiverse-text-muted);
+}
+
+/* The global :focus-visible outline names --lumiverse-accent, which the host
+   does not define, so the accent is spelled out with the host's real variable
+   and a CanvasText fallback; otherwise a keyboard user gets no visible ring
+   on the disclosure. */
+.lt-tag-picker__summary:focus-visible {
+  outline: 2px solid var(--lumiverse-accent, var(--lumiverse-primary, CanvasText));
+  outline-offset: 2px;
+  border-radius: var(--lumiverse-radius, 8px);
+}
+
+/* The closed picker's contents. A small top margin and a hairline separator so
+   the open body reads as a sub-panel of the box rather than as loose content;
+   the rule itself is themed so it survives a light host. */
+.lt-tag-picker__body {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--lumiverse-border, rgba(127, 127, 127, 0.3));
+}
+
+.lt-tag-picker__sub {
+  font-size: 11px;
+  color: var(--lumiverse-text-dim, var(--lumiverse-text-muted, CanvasText));
+}
+
 /* ------------------------------------------------------------------ */
 /* Badges                                                              */
 /* ------------------------------------------------------------------ */

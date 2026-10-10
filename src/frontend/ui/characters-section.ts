@@ -151,6 +151,35 @@ const chipErrors = new Map<string, string>()
  */
 const tagRowsExpanded = new Map<string, boolean>()
 
+/**
+ * Which tag pickers the reader has opened or closed, keyed by `searchSlot`.
+ *
+ * Module scope for the same reason as {@link tagRowsExpanded}: the shell
+ * rebuilds this panel on every store change, so a `<details>` element's `open`
+ * attribute would snap shut (or snap open) on every selection. `undefined`
+ * means "never touched", and the picker then falls back to
+ * {@link pickerDefaultOpen}.
+ */
+const pickerOpenState = new Map<string, boolean>()
+
+/**
+ * Whether a tag picker with no remembered toggle starts open.
+ *
+ * Collapsed when nothing is selected, open once at least one tag is: a picker
+ * with a live selection is in use, and hiding the chips the reader just picked
+ * behind a closed disclosure is how a filter silently becomes invisible. An
+ * untouched picker is the case the collapse exists for — it dumps up to
+ * {@link TAG_OPTION_LIMIT} checkbox rows into a section whose real content is
+ * the character list, so leaving it closed gives that list back the fold.
+ *
+ * A non-empty picker query also opens it: the reader typed into a box that was
+ * open to be typing, and a re-render that collapsed the box mid-keystroke would
+ * drop focus and read as a broken control.
+ */
+function pickerDefaultOpen(selectedCount: number, query: string): boolean {
+  return selectedCount > 0 || query.trim() !== ''
+}
+
 /** Session-authenticated, read-only avatar endpoint for a character. */
 function avatarUrl(id: string): string {
   return `/api/v1/characters/${encodeURIComponent(id)}/avatar`
@@ -406,6 +435,15 @@ export function renderCharactersSection(options: {
    * not mint them (creating a tag is the Tags section's job). Selection is
    * held by the store, so the rebuilt option list is always a reflection of
    * the truth rather than of local state.
+   *
+   * Everything between the selected chips and the "Showing X of Y" footer sits
+   * inside a native `<details>` (`.lt-tag-picker`). Rendering up to
+   * {@link TAG_OPTION_LIMIT} checkbox rows eagerly made this block taller than
+   * the character list it exists to filter, on every render, whether or not the
+   * reader intended to use it; the disclosure gives the list the fold back. The
+   * summary always states the selection count, so a collapsed picker still
+   * reports what was picked. Nothing here changes selection, filtering or the
+   * store contract — it is presentation only.
    */
   const renderTagPicker = (config: {
     title: string
@@ -423,10 +461,19 @@ export function renderCharactersSection(options: {
     box.appendChild(el('p', { class: 'lt-state__detail' }, [config.description]))
 
     const selected = new Set(config.selectedKeys)
+    const query = pickerQueries.get(config.searchSlot) ?? config.searchValue
+    const selectedCount = config.selectedKeys.length
+
+    // The disclosure body: chips, search, options and the truncation footer.
+    // It is built into a fragment and attached either inside the <details>
+    // (when there are tags to show or to search for) or straight onto the box
+    // (when no tag exists at all), so the "no tags exist yet" message is never
+    // hidden behind a click.
+    const body = el('div', { class: 'lt-tag-picker__body' })
 
     const chips = el('div', { class: 'lt-subtag-list' })
     chips.setAttribute('aria-label', `${config.title}: current selection`)
-    if (config.selectedKeys.length === 0) {
+    if (selectedCount === 0) {
       chips.appendChild(el('span', { class: 'lt-badge lt-badge--muted' }, ['nothing selected yet']))
     }
     for (const key of config.selectedKeys) {
@@ -441,7 +488,7 @@ export function renderCharactersSection(options: {
         ),
       )
     }
-    box.appendChild(chips)
+    body.appendChild(chips)
 
     const search = buildSearch(
       config.searchSlot,
@@ -451,30 +498,40 @@ export function renderCharactersSection(options: {
         // The picker's own text filter is pure view state: it is never a
         // mutation, so it goes to module state and never touches the store.
         pickerQueries.set(config.searchSlot, value)
+        // Typing is an explicit request to see the results, and the search box
+        // is only reachable while the disclosure is open — so without this a
+        // re-render could snap the block shut around the keystroke that was
+        // meant to filter it. A remembered "closed" would win over the default
+        // otherwise, since the reader did close it.
+        pickerOpenState.set(config.searchSlot, true)
         render()
       },
     )
-    box.appendChild(field('Find a tag', search))
+    body.appendChild(field('Find a tag', search))
 
-    const needle = (pickerQueries.get(config.searchSlot) ?? config.searchValue).trim().toLowerCase()
+    const needle = query.trim().toLowerCase()
     const matches = store.view.tagIndex.tags.filter(
       (entry) => needle === '' || entry.name.toLowerCase().includes(needle),
     )
 
     if (store.view.tagIndex.tags.length === 0) {
-      box.appendChild(emptyState('No tags exist yet', config.emptyMessage))
+      // No tags exist: there is no list to disclose, and the search box could
+      // only ever return the empty state below it. Rendering the disclosure
+      // would put a "show / hide" control in front of a message that must be
+      // read, so the body is attached directly instead.
+      body.appendChild(emptyState('No tags exist yet', config.emptyMessage))
+      box.appendChild(body)
       return box
     }
 
     if (matches.length === 0) {
-      box.appendChild(
+      body.appendChild(
         emptyState(
           `No existing tag matches “${pickerQueries.get(config.searchSlot) ?? ''}”`,
           'This picker can only assign tags that already exist. Create a new tag from the Tags ' +
             'section, then come back.',
         ),
       )
-      return box
     }
 
     const options = sectionEl('lt-list')
@@ -505,16 +562,55 @@ export function renderCharactersSection(options: {
       )
       options.appendChild(line)
     }
-    box.appendChild(options)
+    if (matches.length > 0) body.appendChild(options)
 
     if (matches.length > shown) {
-      box.appendChild(
+      body.appendChild(
         el('p', { class: 'lt-state__detail' }, [
           `Showing ${shown} of ${matches.length} existing tags — refine your search to see the rest. ` +
             `${tagCountLabel(store.view.tagIndex.tags.length)} exist in total.`,
         ]),
       )
     }
+
+    // A picker with nothing to match is forced open, exactly as the character
+    // row's failed-removal state is: the message inside has to be readable.
+    const open = matches.length === 0 ? true : (pickerOpenState.get(config.searchSlot) ?? pickerDefaultOpen(selectedCount, query))
+
+    const details = el('details', {
+      class: 'lt-tag-picker',
+      open,
+      'aria-label': `${config.title}: tag picker`,
+    })
+
+    // The summary's text IS its accessible name, so it names both the control's
+    // purpose and the state a collapsed picker would otherwise hide.
+    const summary = el('summary', {
+      class: 'lt-tag-picker__summary',
+      'aria-label':
+        `${config.title}. ${selectedTagCountLabel(selectedCount)}. ` +
+        `${matches.length === 0 ? 'Nothing matches this search.' : ''} show / hide the tag list`,
+    })
+    summary.appendChild(
+      el('span', { class: selectedCount > 0 ? 'lt-badge lt-badge--accent' : 'lt-badge lt-badge--muted' }, [
+        selectedTagCountLabel(selectedCount),
+      ]),
+    )
+    summary.appendChild(el('span', { class: 'lt-tag-picker__sub' }, ['find a tag']))
+    details.appendChild(summary)
+
+    // Remembering the toggle is what keeps the reader's choice across the
+    // shell's full rebuilds — without it, picking a tag would collapse the very
+    // list the tag was picked from. `track` keeps it disposable like every other
+    // listener here.
+    track(
+      on(details, 'toggle', () => {
+        pickerOpenState.set(config.searchSlot, details.open)
+      }),
+    )
+
+    details.appendChild(body)
+    box.appendChild(details)
 
     return box
   }
