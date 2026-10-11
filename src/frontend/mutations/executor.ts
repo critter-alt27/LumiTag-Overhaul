@@ -4,19 +4,36 @@
  *
  * Two invariants drive the whole design:
  *
- *  1. **One write per character per attempt.** All of a character's planned
- *     mutations share one intended final tag array, so they collapse into a
- *     single `updateTags` call. Only the tag ARRAY is sent — never a stale
- *     full-character snapshot — so a write can never clobber unrelated fields.
+ *  1. **One write per character per attempt.** A character produces exactly ONE
+ *     planned mutation carrying its complete intended final tag array, and that
+ *     array — never a stale full-character snapshot — is what is sent. A write
+ *     can therefore never clobber unrelated fields. The whole operation's
+ *     writes travel in ONE `updateTagsBatch` call: a round trip per character
+ *     is what exhausted the Termux/WebView host on a large bulk edit.
  *
  *  2. **Never replay a stale snapshot.** Every retry re-reads the character and
  *     recomputes the intended change against the CURRENT tags. A user edit
  *     made between attempts survives, and a write that actually landed before
  *     a timeout is detected instead of being applied twice.
+ *
+ *  3. **Retained reports are a bounded window, never the whole session.**
+ *     {@link RETAINED_REPORT_LIMIT} is the executor's LRU ceiling; nothing else
+ *     may let the retained set grow past it. A report is evicted ONLY once the
+ *     failure panel has had no way to reference it for a whole panel-window, so
+ *     retention is a memory bound and never a visibility change.
+ *
+ *  4. **Progress emission is bounded, not per-character.** A `snapshot()`
+ *     deep-clones every result, so emitting one per character made `execute()`
+ *     allocate O(M^2) `MutationResult`s for M characters — hundreds of
+ *     megabytes of transient garbage on a bulk merge, which OOM-killed the
+ *     Termux WebView *after* the write had already landed. Emissions are
+ *     therefore coalesced on a clock (and skipped entirely when no hook is
+ *     supplied), so the cost is O(M) whatever M is.
  */
 
 import type { CharacterMutationPort } from '../repository'
 import type { LumiTagCharacter } from '../../shared/types'
+import type { BatchFailure } from '../../shared/protocol'
 import { mapWithConcurrency } from '../concurrency'
 import { dedupeTagNames, tagKey } from '../tag-index'
 import type { MutationOp, OperationPreview, PlannedMutation } from './planner'
@@ -29,11 +46,48 @@ import {
   type OperationReport,
 } from './report'
 
-/** Default number of simultaneous character writes. */
+/** Default number of simultaneous character writes during a retry. */
 export const DEFAULT_WRITE_CONCURRENCY = 4
 
+/**
+ * How many finished operation reports stay resident in this executor.
+ *
+ * The failure panel is what the only two readers — `getReport()` and
+ * `runRetry()` — exist to serve, and the store already caps what the panel can
+ * show at `REPORT_LIMIT = 20` (`store.ts`), trimming from the OLDEST end.
+ * Anything the panel can still reference is therefore among the last 20
+ * completed operations.
+ *
+ * 32 rather than 20: `execute()` records each operation TWICE (a live entry at
+ * start, a snapshot at the end), so executor recency and store recency drift by
+ * one, and `runRetry` re-inserts an OLD opId — moving it to the front of the
+ * LRU while the store keeps it in place. A margin of one full panel-window over
+ * the store's own 20 makes eviction unreachable for anything the panel holds,
+ * while still capping the session's report memory at a small constant instead of
+ * letting every bulk edit's `results` array accumulate for the extension's life.
+ */
+export const RETAINED_REPORT_LIMIT = 32
+
+/**
+ * Minimum wall-clock gap between two consecutive `onProgress` emissions.
+ *
+ * Every emission deep-clones the whole result list, so the emission count is
+ * the single multiplier on `execute()`'s allocation cost. At 50ms a listener
+ * sees ~20 updates per second — enough to animate a progress bar, and few
+ * enough that the count tracks how long a merge takes rather than how many
+ * characters it touches.
+ */
+export const PROGRESS_EMIT_INTERVAL_MS = 50
+
 export interface ExecutorOptions {
-  /** Max simultaneous character writes. Default 4. */
+  /**
+   * Max simultaneous character writes during a RETRY. Default 4.
+   *
+   * `execute()` no longer consults it: a bulk edit is one batched write, so
+   * there is nothing left to fan out. Retries stay per-character on purpose —
+   * each one re-reads a single record before deciding what to write — and that
+   * is where the cap still does work.
+   */
   concurrency?: number
   /** Injectable clock for deterministic tests. */
   now?: () => number
@@ -153,6 +207,29 @@ export function applyIntent(
   return dedupeTagNames(out)
 }
 
+/**
+ * Classify a batch reply's per-item failure.
+ *
+ * The backend already did the classification work on its side of the boundary,
+ * where it had the real host error, so its `code`/`retryable` are taken
+ * verbatim — re-deriving them here from the message text alone would lose the
+ * one signal the frontend cannot compute for itself.
+ *
+ * `uncertain` is still derived, and for the same reason the single-character
+ * path derives it: a transient host failure may have written the tags before
+ * it reported the error, so the write's outcome is genuinely unknown and the
+ * safe retry must re-read rather than assume.
+ */
+function classifyBatchFailure(failure: BatchFailure): ClassifiedError {
+  const message = sanitizeMessage(failure.message)
+  return {
+    message,
+    code: failure.code,
+    retryable: failure.retryable,
+    uncertain: TIMEOUT_PATTERN.test(`${failure.code} ${message}`),
+  }
+}
+
 function cloneResult(r: MutationResult): MutationResult {
   return {
     ...r,
@@ -188,8 +265,33 @@ function isRenameLike(op: MutationOp): boolean {
   return op === 'rename' || op === 'merge'
 }
 
-function findResult(report: OperationReport, mutationId: string): MutationResult | undefined {
-  return report.results.find((r) => r.mutationId === mutationId)
+/** `mutationId` → its tracked result, for the whole of one operation. */
+export type ResultIndex = ReadonlyMap<string, MutationResult>
+
+/**
+ * Index a result list by `mutationId`.
+ *
+ * Every write in an operation is looked up several times — once to bump its
+ * attempt, once to record its outcome, once to hand it to `onResult` — so a
+ * linear scan made the executor quadratic: a 300-character bulk edit spent
+ * ~90,000 string comparisons doing bookkeeping it could have done in one pass.
+ *
+ * `mutationId` is unique within an operation, but a hand-built report is a
+ * public input, so a duplicate id keeps the FIRST occurrence. That is what
+ * `Array.prototype.find` returned, and a lookup that changed which record it
+ * resolved to would silently retarget a write.
+ *
+ * The index holds REFERENCES to the result objects and is therefore valid for
+ * as long as the array is only ever mutated in place: results change state
+ * during an operation, and an index rebuilt to follow that would cost a pass
+ * per lookup, which is what it exists to avoid.
+ */
+export function indexResults(results: readonly MutationResult[]): ResultIndex {
+  const index = new Map<string, MutationResult>()
+  for (const r of results) {
+    if (!index.has(r.mutationId)) index.set(r.mutationId, r)
+  }
+  return index
 }
 
 /**
@@ -230,9 +332,23 @@ export class MutationExecutor {
     this.now = typeof options?.now === 'function' ? options.now : () => Date.now()
   }
 
-  /** Execute a reviewed preview: one write per character, results per mutation. */
+  /**
+   * Execute a reviewed preview: one batched write, results per mutation.
+   *
+   * Every non-conflicting character goes out in a single `updateTagsBatch`
+   * request. Each written character is then announced through `onResult`
+   * individually, so the UI's per-item reporting is unchanged by the batching;
+   * a character whose planned changes disagree is announced through
+   * `onProgress` only, as it was before batching, because nothing was attempted
+   * for it.
+   *
+   * `onProgress` is COALESCED (see {@link PROGRESS_EMIT_INTERVAL_MS}) while
+   * `onResult` stays per-mutation: one clone each either way, but a progress
+   * snapshot clones ALL results, so it cannot be per-character.
+   */
   async execute(preview: OperationPreview, hooks?: ExecuteHooks): Promise<OperationReport> {
     const startedAt = this.now()
+    const results = preview.mutations.map((m) => this.pendingResult(m))
     const live: OperationReport = {
       opId: preview.opId,
       op: preview.op,
@@ -240,11 +356,13 @@ export class MutationExecutor {
       tags: [...preview.tags],
       startedAt,
       status: 'running',
-      results: preview.mutations.map((m) => this.pendingResult(m)),
-      totals: computeTotals([]),
+      results,
+      totals: computeTotals(results),
     }
-    live.totals = computeTotals(live.results)
-    this.reports.set(preview.opId, live)
+    this.store(preview.opId, live)
+    // `results` is only ever mutated in place from here on, so the index built
+    // once here stays correct for the whole operation.
+    const index = indexResults(results)
 
     const byCharacter = new Map<string, PlannedMutation[]>()
     for (const m of preview.mutations) {
@@ -253,20 +371,54 @@ export class MutationExecutor {
       else byCharacter.set(m.characterId, [m])
     }
 
+    let lastProgressAt = startedAt
+    let progressEmitted = false
+    /**
+     * Emit one progress snapshot, rate-limited to {@link PROGRESS_EMIT_INTERVAL_MS}.
+     *
+     * `snapshot()` deep-clones every result, so emitting it once per character
+     * made a merge of M characters allocate O(M^2) `MutationResult`s — hundreds
+     * of megabytes of transient garbage, which OOM-killed the Termux WebView
+     * AFTER the write had already succeeded. Coalescing on the injected clock
+     * ties the emission count to the operation's DURATION instead of its width;
+     * a progress bar needs tens of updates a second, not one per character.
+     *
+     * The first emission is unconditional so a listener is told the run has
+     * STARTED before any rate limit can swallow it, and `execute()` always
+     * emits the terminal report itself, so no listener misses an end state.
+     *
+     * With no `onProgress` hook nothing is listening and nothing is derived:
+     * `live.totals`/`live.status` are re-derived by the final snapshot below
+     * and by every reader (`getReport()` re-snapshots; `runRetry` derives its
+     * own working copy), so no in-flight value is observable mid-write.
+     */
     const progress = (): void => {
-      live.totals = computeTotals(live.results)
-      live.status = deriveStatus(live.results, true)
-      hooks?.onProgress?.(snapshot(live, true))
+      const onProgress = hooks?.onProgress
+      if (onProgress === undefined) return
+      const at = this.now()
+      if (progressEmitted && at - lastProgressAt < PROGRESS_EMIT_INTERVAL_MS) return
+      lastProgressAt = at
+      progressEmitted = true
+      const emitted = snapshot(live, true)
+      live.totals = emitted.totals
+      live.status = emitted.status
+      onProgress(emitted)
     }
 
-    await mapWithConcurrency([...byCharacter.entries()], this.concurrency, async ([id, muts]) => {
-      // Defensive invariant: the planner guarantees ONE intended final tag
-      // array per character. If it is ever violated we refuse to guess which
-      // one the user meant, and report a conflict instead of writing.
+    // Characters are resolved into ONE write batch. A conflicting character is
+    // excluded from it rather than guessed at, so a disagreement is never sent
+    // to the host at all.
+    const batches: { id: string; tags: string[]; muts: PlannedMutation[] }[] = []
+    for (const [, muts] of byCharacter) {
+      // Defensive invariant, NOT a live code path: the planner emits exactly one
+      // mutation per character, so this loop body only ever sees one record and
+      // the check is vacuously true. It stays because a hand-built or mutated
+      // `OperationPreview` is a public input, and disagreeing final arrays must
+      // never be resolved by guessing which one the user meant.
       const first = muts[0] as PlannedMutation
       if (!muts.every((m) => sameTagSet(m.targetTags, first.targetTags))) {
         for (const m of muts) {
-          const result = findResult(live, m.mutationId)
+          const result = index.get(m.mutationId)
           if (result) {
             result.state = 'conflict'
             result.retryable = false
@@ -278,42 +430,99 @@ export class MutationExecutor {
           }
         }
         progress()
-        return
+        continue
       }
 
-      const tags = dedupeTagNames(first.targetTags)
       for (const m of muts) {
-        const result = findResult(live, m.mutationId)
+        const result = index.get(m.mutationId)
         if (result) result.attempts += 1
       }
+      batches.push({ id: first.characterId, tags: dedupeTagNames(first.targetTags), muts })
+    }
+
+    if (batches.length > 0) {
+      let outcome: { tagsById: Map<string, string[]>; failures: Map<string, BatchFailure> } | null = null
       try {
-        // ONLY the tag array is sent — never a full-character snapshot.
-        const updated = await this.port.updateTags(id, tags)
-        const post = Array.isArray(updated?.tags) ? updated.tags : tags
-        this.verifyWrite(live, muts, post)
+        // ONE request for the whole operation, and ONLY tag arrays — never a
+        // full-character snapshot.
+        const response = await this.port.updateTagsBatch(
+          batches.map((b) => ({ characterId: b.id, tags: b.tags })),
+        )
+        outcome = {
+          tagsById: new Map(response.updated.map((entry) => [entry.id, entry.tags])),
+          failures: new Map(response.failures.map((failure) => [failure.characterId, failure])),
+        }
       } catch (error) {
-        // One write, but EVERY mutation of that character failed with it, so
-        // the report can still name which tag change failed.
+        // A transport-level failure means NOTHING in this batch is known to have
+        // landed, so every mutation it carried failed with that one error —
+        // exactly as it would have when each character was written separately.
         const classified = classifyError(error)
-        for (const m of muts) {
-          const result = findResult(live, m.mutationId)
-          if (result) this.markFailure(result, classified)
+        for (const batch of batches) {
+          for (const m of batch.muts) {
+            const result = index.get(m.mutationId)
+            if (result) this.markFailure(result, classified)
+          }
         }
       }
-      for (const m of muts) {
-        const result = findResult(live, m.mutationId)
-        if (result) hooks?.onResult?.(cloneResult(result))
+
+      if (outcome !== null) {
+        for (const batch of batches) {
+          const failure = outcome.failures.get(batch.id)
+          if (failure) {
+            // A per-item failure fails ONLY that character's mutations, so the
+            // report can still name which tag change failed.
+            const classified = classifyBatchFailure(failure)
+            for (const m of batch.muts) {
+              const result = index.get(m.mutationId)
+              if (result) this.markFailure(result, classified)
+            }
+          } else {
+            const stored = outcome.tagsById.get(batch.id)
+            if (stored === undefined) {
+              // The host mentioned this character in NEITHER half of the reply:
+              // not as written, not as failed. That is not a success and not a
+              // failure — it is no evidence at all, which is what `uncertain`
+              // means. Falling back to the array we INTENDED to write would make
+              // `intentSatisfied` true by construction and report a write the
+              // host never confirmed. Marked retryable so the retry path re-reads
+              // the character and finds the truth either way.
+              for (const m of batch.muts) {
+                const result = index.get(m.mutationId)
+                if (result) {
+                  this.markFailure(result, {
+                    message: 'The host did not report this character back, so the change cannot be confirmed as saved.',
+                    code: 'unverified',
+                    retryable: true,
+                    uncertain: true,
+                  })
+                }
+              }
+            } else {
+              this.verifyWrite(index, batch.muts, stored)
+            }
+          }
+        }
       }
-      progress()
-    })
+
+      for (const batch of batches) {
+        for (const m of batch.muts) {
+          const result = index.get(m.mutationId)
+          if (result) hooks?.onResult?.(cloneResult(result))
+        }
+        progress()
+      }
+    }
 
     live.finishedAt = this.now()
-    live.status = deriveStatus(live.results, false)
-    live.totals = computeTotals(live.results)
+    // The snapshot carries the derived totals/status, so they are adopted from
+    // it rather than recomputed: the returned report and the executor's own
+    // copy then come from ONE derivation of the same results.
     const report = snapshot(live, false)
+    live.status = report.status
+    live.totals = report.totals
     // Store a SEPARATE snapshot so a caller mutating what it got back can
     // never corrupt the executor's own state.
-    this.reports.set(preview.opId, snapshot(live, false))
+    this.store(preview.opId, snapshot(live, false))
     hooks?.onProgress?.(report)
     return report
   }
@@ -339,12 +548,52 @@ export class MutationExecutor {
   }
 
   getReport(opId: string): OperationReport | undefined {
-    const stored = this.reports.get(opId)
+    const stored = this.touch(opId)
     return stored === undefined ? undefined : snapshot(stored, stored.finishedAt === undefined)
   }
 
-  listReports(): OperationReport[] {
-    return [...this.reports.values()].map((r) => snapshot(r, r.finishedAt === undefined))
+  /**
+   * Record a report and drop whatever fell out of the retention window.
+   *
+   * Re-storing an opId both REPLACES its entry and refreshes its recency, which
+   * is what makes a report the user just retried the least likely to be the one
+   * evicted next.
+   */
+  private store(opId: string, report: OperationReport): void {
+    // Delete first: a Map's iteration order is insertion order, so re-setting
+    // an existing key would otherwise leave the stale position in place.
+    this.reports.delete(opId)
+    this.reports.set(opId, report)
+    this.prune()
+  }
+
+  /** Read a report and mark it most-recently-used. */
+  private touch(opId: string): OperationReport | undefined {
+    const stored = this.reports.get(opId)
+    if (stored === undefined) return undefined
+    this.reports.delete(opId)
+    this.reports.set(opId, stored)
+    return stored
+  }
+
+  /**
+   * Evict least-recently-stored reports until the window is back within
+   * {@link RETAINED_REPORT_LIMIT}.
+   *
+   * A report with no `finishedAt` is STILL RUNNING and is never a candidate:
+   * `execute()` stores the live object up front so a progress read or a retry
+   * racing the write still finds it, and dropping it mid-flight would leave
+   * `runRetry` to silently retry a stale snapshot — the exact failure invariant
+   * 2 exists to prevent. The window is sized far above the number of operations
+   * a user can have in flight at once, so skipping live entries can never make
+   * the bound unreachable in practice.
+   */
+  private prune(): void {
+    for (const [opId, report] of this.reports) {
+      if (this.reports.size <= RETAINED_REPORT_LIMIT) return
+      if (report.finishedAt === undefined) continue
+      this.reports.delete(opId)
+    }
   }
 
   /** True when this exact mutation currently has a retry in flight. */
@@ -364,7 +613,12 @@ export class MutationExecutor {
     report: OperationReport,
     mutationIds: readonly string[],
   ): Promise<OperationReport> {
-    const base = this.reports.get(report.opId) ?? report
+    // `touch`, not `get`: a retry the user just asked for is the strongest
+    // signal that this report is still wanted, so it must refresh recency
+    // before the writes below can push it out of the window. The caller's own
+    // report is the fallback precisely so an evicted entry can never leave a
+    // retry operating on nothing.
+    const base = this.touch(report.opId) ?? report
     const working: OperationReport = {
       ...base,
       results: cloneResults(base.results),
@@ -372,10 +626,11 @@ export class MutationExecutor {
     }
     working.status = deriveStatus(working.results, true)
     working.totals = computeTotals(working.results)
+    const index = indexResults(working.results)
 
     const targets = new Set<string>()
     for (const id of mutationIds) {
-      const r = findResult(working, id)
+      const r = index.get(id)
       // Already resolved, or unknown → no-op. A retry must never re-apply a
       // change that is already applied.
       if (!r) continue
@@ -387,7 +642,7 @@ export class MutationExecutor {
     // so a later one always observes the earlier one's write.
     const byCharacter = new Map<string, string[]>()
     for (const id of targets) {
-      const r = findResult(working, id) as MutationResult
+      const r = index.get(id) as MutationResult
       const list = byCharacter.get(r.characterId)
       if (list) list.push(id)
       else byCharacter.set(r.characterId, [id])
@@ -395,7 +650,7 @@ export class MutationExecutor {
 
     await mapWithConcurrency([...byCharacter.entries()], this.concurrency, async ([, ids]) => {
       for (const id of ids) {
-        const mine = findResult(working, id) as MutationResult
+        const mine = index.get(id) as MutationResult
 
         // Duplicate retry: an attempt for this exact mutation is already
         // running. Starting a second one could double-apply the write, so we
@@ -418,10 +673,10 @@ export class MutationExecutor {
     })
 
     working.finishedAt = this.now()
-    working.status = deriveStatus(working.results, false)
-    working.totals = computeTotals(working.results)
     const final = snapshot(working, false)
-    this.reports.set(working.opId, snapshot(working, false))
+    working.status = final.status
+    working.totals = final.totals
+    this.store(working.opId, snapshot(working, false))
     return final
   }
 
@@ -509,12 +764,12 @@ export class MutationExecutor {
 
   /** Confirm the returned record actually satisfies every mutation's intent. */
   private verifyWrite(
-    report: OperationReport,
+    index: ResultIndex,
     muts: readonly PlannedMutation[],
     postTags: readonly string[],
   ): void {
     for (const m of muts) {
-      const result = findResult(report, m.mutationId)
+      const result = index.get(m.mutationId)
       if (result === undefined) continue
       if (intentSatisfied(postTags, m)) {
         result.state = 'succeeded'

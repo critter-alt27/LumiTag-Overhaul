@@ -1,9 +1,15 @@
 import { describe, expect, test } from 'bun:test'
 
 import type { CharacterMutationPort } from '../src/frontend/repository'
-import type { LumiTagCharacter } from '../src/shared/types'
+import type { BatchFailure } from '../src/shared/protocol'
+import type { CharacterTags, LumiTagCharacter } from '../src/shared/types'
 import type { MutationOp, OperationPreview, PlannedMutation } from '../src/frontend/mutations/planner'
-import { classifyError, MutationExecutor } from '../src/frontend/mutations/executor'
+import { planOperation } from '../src/frontend/mutations/planner'
+import {
+  classifyError,
+  MutationExecutor,
+  RETAINED_REPORT_LIMIT,
+} from '../src/frontend/mutations/executor'
 import {
   computeTotals,
   deriveStatus,
@@ -52,12 +58,32 @@ function character(id: string, name: string, tags: string[]): LumiTagCharacter {
 /**
  * A programmable server: mutable state, per-character write scripting and full
  * call recording so tests can assert exactly which writes happened.
+ *
+ * `updateTagsBatch` mirrors the real backend: ONE call in, and per character
+ * either an `updated` entry or a `failures[]` entry — never a throw, unless
+ * `batchFails` is set, which stands for a whole-request transport failure.
  */
 class MockPort implements CharacterMutationPort {
   readonly server = new Map<string, LumiTagCharacter>()
   readonly deleted = new Set<string>()
   readonly writes: { id: string; tags: string[] }[] = []
   readonly gets: string[] = []
+  /** Every batched write request, so the transport's round-trip count is assertable. */
+  readonly batchWrites: { updates: { characterId: string; tags: string[] }[] }[] = []
+  /** When set, the NEXT batched write throws instead of answering. */
+  batchFails: unknown = null
+  /**
+   * Optional rewrite of the assembled reply, standing in for a host whose
+   * `updated` entries are LOSSY — one character silently absent, or carried
+   * under a blank/misnamed `id`. The write still happened server-side; only the
+   * evidence came back damaged.
+   */
+  batchReplyHook:
+    | ((reply: { updated: CharacterTags[]; failures: BatchFailure[] }) => {
+        updated: CharacterTags[]
+        failures: BatchFailure[]
+      })
+    | null = null
   private readonly script: Script = {}
   private readonly getFailures = new Map<string, unknown>()
   private inFlight = 0
@@ -121,6 +147,44 @@ class MockPort implements CharacterMutationPort {
     } finally {
       this.inFlight -= 1
     }
+  }
+
+  async getTagsBatch(ids: readonly string[]): Promise<Map<string, CharacterTags>> {
+    const out = new Map<string, CharacterTags>()
+    for (const id of ids) {
+      const found = this.server.get(id)
+      if (found) out.set(id, { id, tags: [...found.tags] })
+    }
+    return out
+  }
+
+  async updateTagsBatch(
+    updates: { characterId: string; tags: string[] }[],
+  ): Promise<{ updated: CharacterTags[]; failures: BatchFailure[] }> {
+    this.batchWrites.push({ updates: updates.map((u) => ({ ...u, tags: [...u.tags] })) })
+    if (this.batchFails !== null) {
+      const failure = this.batchFails
+      this.batchFails = null
+      throw failure
+    }
+
+    const updated: CharacterTags[] = []
+    const failures: BatchFailure[] = []
+    for (const update of updates) {
+      try {
+        const written = await this.updateTags(update.characterId, update.tags)
+        updated.push({ id: written.id, tags: [...written.tags] })
+      } catch (error) {
+        const classified = classifyError(error)
+        failures.push({
+          characterId: update.characterId,
+          code: classified.code ?? 'internal',
+          message: classified.message,
+          retryable: classified.retryable,
+        })
+      }
+    }
+    return this.batchReplyHook === null ? { updated, failures } : this.batchReplyHook({ updated, failures })
   }
 }
 
@@ -881,7 +945,6 @@ describe('14. counts and the remaining-failures list stay consistent', () => {
     const stored = executor.getReport(report.opId)!
     expect(stored.totals).toEqual(computeTotals(stored.results))
     expect(stored.status).toBe('failed')
-    expect(executor.listReports()).toHaveLength(1)
   })
 })
 
@@ -978,10 +1041,27 @@ describe('only the tag array is ever sent', () => {
   })
 })
 
-describe('bounded concurrency', () => {
-  test('in-flight writes never exceed the configured cap', async () => {
+describe('batched write transport', () => {
+  test('twelve characters cost ONE request, not twelve', async () => {
     const port = new MockPort()
     const ids = Array.from({ length: 12 }, (_, i) => `c${i}`)
+    for (const id of ids) port.seed(id, id, [])
+
+    const report = await new MutationExecutor(port).execute(
+      previewOf(ids.map((characterId) => planMutation({ characterId, addedTags: ['Elf'] }))),
+    )
+
+    // The whole point of batching: the message channel sees one message, and the
+    // per-character writes all still happen inside it.
+    expect(port.batchWrites).toHaveLength(1)
+    expect(port.batchWrites[0]?.updates.map((u) => u.characterId)).toEqual(ids)
+    expect(port.writes).toHaveLength(12)
+    expect(report.status).toBe('succeeded')
+  })
+
+  test('the write concurrency option no longer multiplies round trips', async () => {
+    const port = new MockPort()
+    const ids = Array.from({ length: 9 }, (_, i) => `c${i}`)
     for (const id of ids) port.seed(id, id, [])
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
@@ -989,19 +1069,16 @@ describe('bounded concurrency', () => {
     })
     port.gate = { promise: gate, release }
 
-    const executor = new MutationExecutor(port, { concurrency: 3 })
-    const pending = executor.execute(
+    const pending = new MutationExecutor(port, { concurrency: 3 }).execute(
       previewOf(ids.map((characterId) => planMutation({ characterId, addedTags: ['Elf'] }))),
     )
     await new Promise((resolve) => setTimeout(resolve, 10))
-    expect(port.maxInFlight).toBe(3)
+    expect(port.batchWrites).toHaveLength(1)
     release()
-    const report = await pending
-    expect(port.maxInFlight).toBeLessThanOrEqual(3)
-    expect(report.status).toBe('succeeded')
+    expect((await pending).status).toBe('succeeded')
   })
 
-  test('a concurrency below 1 is clamped to 1, not a deadlock', async () => {
+  test('a concurrency below 1 is clamped, not a deadlock', async () => {
     const port = new MockPort()
     port.seed('c1', 'A', [])
     port.seed('c2', 'B', [])
@@ -1012,7 +1089,265 @@ describe('bounded concurrency', () => {
       ]),
     )
     expect(report.status).toBe('succeeded')
-    expect(port.maxInFlight).toBe(1)
+    expect(port.batchWrites).toHaveLength(1)
+  })
+
+  test('an empty preview never reaches the transport', async () => {
+    const port = new MockPort()
+    const report = await new MutationExecutor(port).execute(previewOf([]))
+    expect(port.batchWrites).toHaveLength(0)
+    expect(report.results).toHaveLength(0)
+  })
+
+  test('a conflicting character is excluded from the batch, not written', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.seed('c2', 'B', [])
+    const a = planMutation({ characterId: 'c1', addedTags: ['Elf'] })
+    const b = planMutation({ characterId: 'c1', addedTags: ['Dark'] })
+    ;(b as PlannedMutation).targetTags = ['Totally', 'Different']
+
+    const report = await new MutationExecutor(port).execute(
+      previewOf([a, b, planMutation({ characterId: 'c2', addedTags: ['Elf'] })]),
+    )
+
+    // The disagreement is never sent; the well-formed character still is.
+    expect(port.batchWrites[0]?.updates.map((u) => u.characterId)).toEqual(['c2'])
+    expect(port.tagsOf('c1')).toEqual([])
+    expect(port.tagsOf('c2')).toEqual(['Elf'])
+    expect(report.results.filter((r) => r.state === 'conflict')).toHaveLength(2)
+    expect(report.results.filter((r) => r.state === 'succeeded')).toHaveLength(1)
+  })
+})
+
+describe('batch failures', () => {
+  test('one item failing leaves every other character written and reported', async () => {
+    const port = new MockPort()
+    port.seed('ok1', 'A', [])
+    port.seed('bad', 'B', [])
+    port.seed('ok2', 'C', [])
+    port.scriptWrites('bad', [{ kind: 'error', error: new Error('Character not found') }])
+
+    const report = await new MutationExecutor(port).execute(
+      previewOf([
+        planMutation({ characterId: 'ok1', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'bad', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'ok2', addedTags: ['Elf'] }),
+      ]),
+    )
+
+    expect(report.status).toBe('partially_completed')
+    expect(report.totals).toEqual({ total: 3, succeeded: 2, failed: 1, remaining: 1 })
+    const failure = report.results.find((r) => r.characterId === 'bad') as MutationResult
+    expect(failure.state).toBe('failed')
+    expect(failure.error?.message).toBe('Character not found')
+    // `not found` is terminal: a retry can never fix a deleted character.
+    expect(failure.retryable).toBe(false)
+    expect(port.tagsOf('bad')).toEqual([])
+    expect(port.tagsOf('ok1')).toEqual(['Elf'])
+    expect(port.tagsOf('ok2')).toEqual(['Elf'])
+    assertTotalsConsistent(report)
+  })
+
+  test('a per-item failure keeps its own code and retryability', async () => {
+    const port = new MockPort()
+    port.seed('bad', 'B', [])
+    port.scriptWrites('bad', [{ kind: 'error', error: new Error('network unreachable') }])
+
+    const report = await new MutationExecutor(port).execute(
+      previewOf([planMutation({ characterId: 'bad', addedTags: ['Elf'] })]),
+    )
+
+    const failure = report.results[0] as MutationResult
+    expect(failure.state).toBe('failed')
+    expect(failure.retryable).toBe(true)
+    expect(failure.error?.code).toBe('timeout')
+    // The host may have written before it failed, so the outcome is unknown.
+    expect(failure.uncertain).toBe(true)
+    expect(failure.attempts).toBe(1)
+  })
+
+  test('a failed item of a multi-mutation character fails only that character', async () => {
+    const port = new MockPort()
+    port.seed('bad', 'B', [])
+    port.seed('ok', 'O', [])
+    port.scriptWrites('bad', [{ kind: 'error', error: new Error('boom') }])
+
+    const report = await new MutationExecutor(port).execute(
+      previewOf([
+        planMutation({ characterId: 'bad', tag: 'Elf', addedTags: ['Elf'], targetTags: ['Elf', 'Dark'] }),
+        planMutation({ characterId: 'bad', tag: 'Dark', addedTags: ['Dark'], targetTags: ['Elf', 'Dark'] }),
+        planMutation({ characterId: 'ok', addedTags: ['Elf'] }),
+      ]),
+    )
+
+    expect(report.results.filter((r) => r.characterId === 'bad').every((r) => r.state === 'failed')).toBe(true)
+    expect(report.results.filter((r) => r.characterId === 'ok').every((r) => r.state === 'succeeded')).toBe(true)
+    // Both of the failed character's mutations are individually retryable.
+    expect(report.results.filter((r) => r.characterId === 'bad').every((r) => r.retryable)).toBe(true)
+  })
+
+  test('a whole-request transport failure fails every mutation in the batch', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.seed('c2', 'B', [])
+    port.batchFails = timeoutError()
+
+    const report = await new MutationExecutor(port).execute(
+      previewOf([
+        planMutation({ characterId: 'c1', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'c2', addedTags: ['Elf'] }),
+      ]),
+    )
+
+    expect(report.status).toBe('failed')
+    expect(report.totals).toEqual({ total: 2, succeeded: 0, failed: 2, remaining: 2 })
+    for (const result of report.results as MutationResult[]) {
+      expect(result.error?.code).toBe('timeout')
+      expect(result.uncertain).toBe(true)
+      expect(result.retryable).toBe(true)
+      // The attempt was counted even though the request never landed.
+      expect(result.attempts).toBe(1)
+    }
+    assertTotalsConsistent(report)
+  })
+
+  test('a transport failure is still safely retryable per character', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.batchFails = timeoutError()
+    const executor = new MutationExecutor(port)
+    const first = await executor.execute(previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]))
+
+    const retried = await executor.retryOne(first, first.results[0]!.mutationId)
+    expect((retried.results[0] as MutationResult).state).toBe('resolved_on_retry')
+    expect(port.tagsOf('c1')).toEqual(['Elf'])
+  })
+
+  test('hooks still fire once per mutation, and progress ends on the final report', async () => {
+    const port = new MockPort()
+    port.seed('ok1', 'A', [])
+    port.seed('bad', 'B', [])
+    port.seed('ok2', 'C', [])
+    port.scriptWrites('bad', [{ kind: 'error', error: new Error('boom') }])
+
+    const onResult: string[] = []
+    const progressCounts: number[] = []
+    // A frozen clock makes the coalescing deterministic: a run that completes
+    // with no time passing is the "already fast" end of the rate limit.
+    await new MutationExecutor(port, { now: () => 1234 }).execute(
+      previewOf([
+        planMutation({ characterId: 'ok1', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'bad', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'ok2', tag: 'Dark', addedTags: ['Dark'] }),
+      ]),
+      {
+        onResult: (r) => onResult.push(`${r.characterId}:${r.state}`),
+        onProgress: (r) => progressCounts.push(r.results.filter((x) => x.state !== 'pending').length),
+      },
+    )
+
+    expect(onResult.sort()).toEqual(['bad:failed', 'ok1:succeeded', 'ok2:succeeded'])
+    // CHANGED CONTRACT (was: "one per character", asserted as exactly 4).
+    // `onProgress` is now COALESCED on the clock rather than per-character: each
+    // emission deep-clones every result, so one-per-character made a merge of M
+    // characters allocate O(M^2) and OOM the WebView after the write landed.
+    // What the listener still depends on is unchanged and still asserted —
+    // the last emission reports EVERY character settled, not one fewer.
+    expect(progressCounts[progressCounts.length - 1]).toBe(3)
+    // The primed first emission, plus the terminal one.
+    expect(progressCounts.length).toBe(2)
+  })
+
+  test('the returned report is a separate object from the executor state', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]))
+
+    report.results[0]!.state = 'failed'
+    report.results[0]!.sourceTags.push('not-a-real-tag')
+
+    const stored = executor.getReport(report.opId)!
+    expect(stored.results[0]!.state).toBe('succeeded')
+    expect(stored.status).toBe('succeeded')
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* Never report success from optimistic state                                   */
+/* -------------------------------------------------------------------------- */
+
+describe('an unverified batch entry is not a success', () => {
+  /**
+   * The reply's `updated` is the ONLY host evidence a bulk write produces, so
+   * any character it fails to name has an unknown outcome — whatever the host
+   * actually stored. Falling back to the array we INTENDED to write would make
+   * `intentSatisfied` true by construction and report a save that was never
+   * confirmed, which is exactly the invariant this codebase is built around.
+   */
+  test('a character the reply omits entirely is failed, not succeeded', async () => {
+    const port = new MockPort()
+    port.seed('ok1', 'A', [])
+    port.seed('lost', 'B', [])
+    port.batchReplyHook = ({ updated, failures }) => ({
+      updated: updated.filter((entry) => entry.id !== 'lost'),
+      failures,
+    })
+
+    const report = await new MutationExecutor(port).execute(
+      previewOf([
+        planMutation({ characterId: 'ok1', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'lost', addedTags: ['Elf'] }),
+      ]),
+    )
+
+    // The write DID reach the host — `lost` really has the tag. That is exactly
+    // why the result must be `uncertain` rather than a confident failure.
+    expect(port.tagsOf('lost')).toEqual(['Elf'])
+    const lost = report.results.find((r) => r.characterId === 'lost') as MutationResult
+    expect(lost.state).toBe('failed')
+    expect(lost.retryable).toBe(true)
+    expect(lost.uncertain).toBe(true)
+    expect(report.results.find((r) => r.characterId === 'ok1')?.state).toBe('succeeded')
+    assertTotalsConsistent(report)
+  })
+
+  test('an entry the host names with a blank or absent id is not a success', async () => {
+    // `normalizeCharacterTagsOnly` yields `id: ''` for a missing/blank host id
+    // and never throws, so a misnamed id silently misses the correlation map.
+    for (const badId of ['', 'some-other-id']) {
+      const port = new MockPort()
+      port.seed('c1', 'A', [])
+      port.batchReplyHook = ({ updated, failures }) => ({
+        updated: updated.map((entry) => ({ id: badId, tags: entry.tags })),
+        failures,
+      })
+
+      const report = await new MutationExecutor(port).execute(
+        previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]),
+      )
+
+      expect(report.results[0]!.state).toBe('failed')
+      expect(report.results[0]!.uncertain).toBe(true)
+      expect(report.results[0]!.retryable).toBe(true)
+      assertTotalsConsistent(report)
+    }
+  })
+
+  test('an uncertain failure resolves on retry instead of double-applying', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.batchReplyHook = ({ updated, failures }) => ({ updated: updated.filter(() => false), failures })
+    const executor = new MutationExecutor(port)
+    const first = await executor.execute(previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]))
+
+    // The retry RE-READS: the write did land, so it recognises its own work and
+    // re-applies nothing.
+    const retried = await executor.retryOne(first, first.results[0]!.mutationId)
+    expect((retried.results[0] as MutationResult).state).toBe('resolved_on_retry')
+    expect(port.writesFor('c1')).toHaveLength(1)
+    expect(port.tagsOf('c1')).toEqual(['Elf'])
   })
 })
 
@@ -1140,6 +1475,96 @@ describe('rename and merge safety', () => {
     expect(groups).toHaveLength(1)
     expect(groups[0]?.key).toBe('mage->magic')
     expect(groups[0]?.label).toBe('Mage → Magic')
+  })
+})
+
+describe('end to end: a real planner preview through the executor', () => {
+  /** `count` characters carrying `tags`. */
+  function bulk(count: number, tags: string[]): LumiTagCharacter[] {
+    return Array.from({ length: count }, (_, i) =>
+      character(`c${String(i + 1).padStart(4, '0')}`, `Char ${String(i + 1).padStart(4, '0')}`, tags),
+    )
+  }
+
+  test('a collapsed bulk delete writes once per character and reports one failure per character', async () => {
+    const port = new MockPort()
+    const set = bulk(4, ['Elf', 'Dark', 'Knight'])
+    for (const c of set) port.seed(c.id, c.name, [...c.tags])
+    port.scriptWrites('c0003', [{ kind: 'error', error: new Error('boom') }])
+
+    const preview = planOperation(set, { op: 'delete', tags: ['Elf', 'Dark'] })
+    expect(preview.mutations).toHaveLength(4)
+
+    const report = await new MutationExecutor(port).execute(preview)
+    // One write per character, carrying the FULL final array.
+    expect(port.batchWrites).toHaveLength(1)
+    expect(port.batchWrites[0]?.updates).toHaveLength(4)
+    for (const update of port.batchWrites[0]?.updates ?? []) {
+      expect(update.tags).toEqual(['Knight'])
+    }
+    expect(report.totals).toEqual({ total: 4, succeeded: 3, failed: 1, remaining: 1 })
+
+    // The single collapsed mutation's group names BOTH removed tags.
+    const groups = groupFailures(report)
+    expect(groups).toHaveLength(1)
+    expect(groups[0]?.key).toBe('dark+elf')
+    expect(groups[0]?.label).toBe('Dark, Elf')
+    expect(groups[0]?.failures.map((f) => f.characterId)).toEqual(['c0003'])
+
+    // retryGroup resolves that key back to the right mutation, and only it.
+    const retried = await new MutationExecutor(port).retryGroup(report, groups[0]!.key)
+    expect(port.tagsOf('c0003')).toEqual(['Knight'])
+    expect(retried.totals).toEqual({ total: 4, succeeded: 4, failed: 0, remaining: 0 })
+    assertTotalsConsistent(retried)
+  })
+
+  test('a collapsed bulk merge applies every source in one write, retryable as a unit', async () => {
+    const port = new MockPort()
+    const set = bulk(3, ['Elf', 'Dark', 'Mage', 'Fire'])
+    for (const c of set) port.seed(c.id, c.name, [...c.tags])
+    port.scriptWrites('c0002', [{ kind: 'error', error: new Error('boom') }])
+
+    const preview = planOperation(set, {
+      op: 'merge',
+      primary: 'Magic',
+      targets: ['Elf', 'Dark', 'Mage'],
+    })
+    expect(preview.mutations).toHaveLength(3)
+
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(preview)
+    expect(port.tagsOf('c0001')).toEqual(['Magic', 'Fire'])
+    expect(report.totals).toEqual({ total: 3, succeeded: 2, failed: 1, remaining: 1 })
+
+    const groups = groupFailures(report)
+    expect(groups).toHaveLength(1)
+    expect(groups[0]?.key).toBe('dark+elf+mage->magic')
+    expect(groups[0]?.label).toBe('Dark, Elf, Mage → Magic')
+
+    const writesBeforeRetry = port.writesFor('c0002').length
+    const retried = await executor.retryGroup(report, groups[0]!.key)
+    // All three sources folded in by ONE retry write; Fire survived.
+    expect(port.writesFor('c0002').length).toBe(writesBeforeRetry + 1)
+    // The retry recomputes from the freshly read record rather than replaying
+    // the planned array, so Magic lands after the untouched tag — same SET.
+    expect(port.tagsOf('c0002').sort()).toEqual(['Fire', 'Magic'])
+    expect(retried.totals.remaining).toBe(0)
+  })
+
+  test('a character that already carries only one of the sources gets a one-tag record', async () => {
+    const port = new MockPort()
+    const set = [character('a', 'A', ['Elf', 'Knight']), character('b', 'B', ['Dark', 'Elf', 'Knight'])]
+    for (const c of set) port.seed(c.id, c.name, [...c.tags])
+
+    const preview = planOperation(set, { op: 'delete', tags: ['Elf', 'Dark'] })
+    const groups = groupFailures(
+      await new MutationExecutor(port).execute(preview).then((r) => ({ ...r, results: r.results.map((x) => ({ ...x, state: 'failed' as const })) })),
+    )
+    // Different source sets → different groups, so a retry never spans writes
+    // that are not the same change.
+    expect(groups.map((g) => g.key).sort()).toEqual(['dark+elf', 'elf'])
+    expect(groups.find((g) => g.key === 'elf')?.label).toBe('Elf')
+    expect(groups.find((g) => g.key === 'dark+elf')?.label).toBe('Dark, Elf')
   })
 })
 
@@ -1359,5 +1784,153 @@ describe('returned reports are snapshots', () => {
   test('an unknown opId has no report', () => {
     const executor = new MutationExecutor(new MockPort())
     expect(executor.getReport('nope')).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Report retention
+// ---------------------------------------------------------------------------
+
+describe('retained reports are a bounded LRU window', () => {
+  /** The store's own panel cap, mirrored so the UI's reach is what is asserted. */
+  const UI_REPORT_LIMIT = 20
+
+  /**
+   * Run `count` distinct single-character operations and return their opIds in
+   * execution order. Distinct characters keep every opId distinct, so each one
+   * occupies its own slot in the window.
+   */
+  async function runOperations(
+    executor: MutationExecutor,
+    port: MockPort,
+    count: number,
+  ): Promise<string[]> {
+    const opIds: string[] = []
+    for (let i = 0; i < count; i++) {
+      const id = `c${i}`
+      port.seed(id, `C${i}`, [])
+      const report = await executor.execute(
+        previewOf([planMutation({ characterId: id, addedTags: ['Elf'] })]),
+      )
+      opIds.push(report.opId)
+    }
+    return opIds
+  }
+
+  test('evicts once the window is exceeded, keeping the count at the limit', async () => {
+    const port = new MockPort()
+    const executor = new MutationExecutor(port)
+    const opIds = await runOperations(executor, port, RETAINED_REPORT_LIMIT + 10)
+
+    // Every id is now past the window, so the oldest ones must be gone...
+    expect(executor.getReport(opIds[0]!)).toBeUndefined()
+    expect(executor.getReport(opIds[9]!)).toBeUndefined()
+    // ...and the window holds exactly RETAINED_REPORT_LIMIT reports, no more.
+    const survivors = opIds.filter((id) => executor.getReport(id) !== undefined)
+    expect(survivors).toHaveLength(RETAINED_REPORT_LIMIT)
+  })
+
+  test('a report read recently survives a flood that would otherwise evict it', async () => {
+    const port = new MockPort()
+    const executor = new MutationExecutor(port)
+    const opIds = await runOperations(executor, port, RETAINED_REPORT_LIMIT)
+    const oldest = opIds[0]!
+
+    // Reading it makes it the most-recently-used entry, so it is promoted past
+    // the whole rest of the window...
+    expect(executor.getReport(oldest)).toBeDefined()
+
+    // ...and a flood that would have evicted it on its first write does not.
+    await runOperations(executor, port, RETAINED_REPORT_LIMIT - 1)
+    expect(executor.getReport(oldest)).toBeDefined()
+
+    // It is genuinely LRU-ordered, not simply exempt: the untouchled next-oldest
+    // is what the flood evicted instead.
+    expect(executor.getReport(opIds[1]!)).toBeUndefined()
+  })
+
+  test('a report still inside the failure panel\'s window is never evicted', async () => {
+    const port = new MockPort()
+    const executor = new MutationExecutor(port)
+    // More operations than the store can show, so the panel has genuinely
+    // dropped the early ones by the time the later ones are running.
+    const opIds = await runOperations(executor, port, UI_REPORT_LIMIT + RETAINED_REPORT_LIMIT)
+
+    // Exactly the opIds the store would still be holding, oldest first.
+    const visible = opIds.slice(opIds.length - UI_REPORT_LIMIT)
+    for (const id of visible) {
+      expect(executor.getReport(id)).toBeDefined()
+    }
+  })
+
+  test('runRetry against a retained report still retries it', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(
+      previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]),
+    )
+    expect(report.totals.failed).toBe(1)
+
+    // Fill the window past the limit: `report` is now near eviction.
+    await runOperations(executor, port, RETAINED_REPORT_LIMIT + 1)
+
+    const retried = await executor.retryOne(report, report.results[0]!.mutationId)
+    expect(retried.results[0]?.state).toBe('resolved_on_retry')
+    assertTotalsConsistent(retried)
+    expect(executor.getReport(report.opId)?.totals.failed).toBe(0)
+  })
+
+  test('a retry on an already-evicted report falls back to the caller\'s copy', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(
+      previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]),
+    )
+
+    await runOperations(executor, port, RETAINED_REPORT_LIMIT + 5)
+    expect(executor.getReport(report.opId)).toBeUndefined()
+
+    // The store always passes its own report object, so a retry is still fully
+    // functional — it just cannot be silently a no-op.
+    const retried = await executor.retryOne(report, report.results[0]!.mutationId)
+    expect(retried.results[0]?.state).toBe('resolved_on_retry')
+  })
+
+  test('an operation still running is not evicted by the operations after it', async () => {
+    const port = new MockPort()
+    const executor = new MutationExecutor(port)
+    port.seed('live', 'Live', [])
+
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    port.gate = { promise: parked, release }
+
+    const live = previewOf([planMutation({ characterId: 'live', addedTags: ['Elf'] })])
+    const running = executor.execute(live)
+    // Let the write reach the gate so the report is genuinely unfinished.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // Only the live write parks; the flood after it must run to completion.
+    port.gate = null
+    await runOperations(executor, port, RETAINED_REPORT_LIMIT + 2)
+
+    // Still resident, and still the LIVE object — not replaced by a stale
+    // snapshot — so a progress read or a retry racing the write sees the
+    // running state rather than a finished report that never happened.
+    const midFlight = executor.getReport(live.opId)
+    expect(midFlight?.finishedAt).toBeUndefined()
+    expect(midFlight?.status).toBe('running')
+
+    release()
+    const finished = await running
+    expect(finished.status).toBe('succeeded')
+    expect(executor.getReport(finished.opId)?.status).toBe('succeeded')
   })
 })

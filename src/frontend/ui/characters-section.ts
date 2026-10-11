@@ -30,8 +30,12 @@
  * 6. **Re-rendering is the shell's job.** `renderShell` rebuilds the section
  *    on every store change, so this renderer does not subscribe to the store
  *    itself (a second subscription would leak a listener per shell render).
- *    The little state it does keep — caret intent and in-flight chip keys —
- *    lives at module scope precisely so it survives that full rebuild.
+ *    The little state it does keep — search focus intent, caret, in-flight chip
+ *    keys, typed picker text — lives at module scope precisely so it survives
+ *    that full rebuild. In particular `destroy()` IS the re-render path (the
+ *    shell mounts a section by releasing the outgoing one and rendering a new
+ *    one), so it must NOT drop the focus intent; only a genuine abandonment of
+ *    a search box does.
  * 7. **Bounded rendering.** At most {@link ROW_LIMIT} character rows and
  *    {@link TAG_OPTION_LIMIT} tag options are rendered eagerly; the rest are
  *    reported as counts, and counts always come from the store's totals rather
@@ -93,8 +97,30 @@ const FILTER_OPTIONS: readonly { value: CharacterTagFilter; label: string }[] =
 /** Filter modes that consult the active tag-filter selection. */
 const TAG_AWARE_FILTERS: readonly CharacterTagFilter[] = ['any', 'all_of']
 
-/** Previous focused search slot and caret for focus restoration. */
+/**
+ * Which search slot held focus before the last rebuild, and at what caret.
+ *
+ * A slot NAME rather than a boolean, because this panel has several search
+ * boxes at once — the main character search plus one per tag picker — and focus
+ * in ANY of them has to survive a rebuild; collapsing this to one flag would
+ * restore focus into the wrong box.
+ *
+ * Module-level, not render-scoped: {@link restoreSearchIntents} runs after the
+ * render body that recorded the intent has already returned, so a render-scoped
+ * snapshot would be out of scope by the time it is read.
+ *
+ * Written by the search box's `focus`/`blur`/`keyup`/`select` listeners and
+ * refreshed from the live DOM at the top of `render()`; `destroy()` must not
+ * clear it, because destroying this panel is how the shell re-renders it.
+ */
 let prevSlot: string | null = null
+
+/**
+ * Caret offset in the slot named by {@link prevSlot}.
+ *
+ * Always gated by that slot, so a stale offset can never restore a caret the
+ * reader is no longer typing at.
+ */
 let prevSlotCaret = 0
 
 /** Identity of one removable chip: character id plus tag key. Never a name. */
@@ -140,6 +166,20 @@ const tagRowsExpanded = new Map<string, boolean>()
  * {@link pickerDefaultOpen}.
  */
 const pickerOpenState = new Map<string, boolean>()
+
+/**
+ * Text typed into the tag pickers, keyed by `searchSlot`.
+ *
+ * Pure view state: it filters options and is never a mutation, so it is kept at
+ * module scope — beside {@link pickerOpenState}, for the same reason — to survive
+ * the shell's rebuild. Renderer scope would not: the shell mounts a section by
+ * releasing the outgoing handle and calling `renderCharactersSection` afresh, so
+ * a renderer-scoped map is empty again on the very commit the reader's debounced
+ * keystroke produced, and the rebuilt box would come back empty while
+ * {@link restoreSearchIntents} tried to restore a caret into it.
+ */
+const pickerQueries = new Map<string, string>()
+
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 let pickerTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -261,9 +301,10 @@ export function renderCharactersSection(options: {
   /**
    * A search box that survives the shell's full rebuild.
    *
-   * Focus and caret are recorded in module state and restored by
-   * {@link restoreSearchIntents} after the rebuild, so typing does not lose
-   * the caret mid-word.
+   * Focus and caret are recorded in module state ({@link prevSlot},
+   * {@link prevSlotCaret}) and restored by {@link restoreSearchIntents} after
+   * the rebuild, so typing does not lose the caret mid-word. `slot` is the
+   * stable identity used to find this box again after the rebuild.
    */
   const buildSearch = (
     slot: string,
@@ -290,22 +331,41 @@ export function renderCharactersSection(options: {
     )
     track(
       on(input, 'blur', () => {
-        prevSlot = null
+        // A detached node also blurs, and the shell detaches this input on
+        // every rebuild, so a blur from a node that has left the document is
+        // the panel being replaced — not the reader moving on — and the intent
+        // must outlive it.
+        if (input.isConnected) prevSlot = null
       }),
     )
-    track(
-      on(input, 'keyup', () => {
-        prevSlotCaret = input.selectionStart ?? input.value.length
-      }),
-    )
+    // `keyup` alone misses a caret moved by clicking in the box or by
+    // select-all, so `select` keeps the offset exact on every re-render.
+    const recordCaret = (): void => {
+      prevSlotCaret = input.selectionStart ?? input.value.length
+    }
+    track(on(input, 'keyup', recordCaret))
+    track(on(input, 'select', recordCaret))
     return input
   }
 
-  /** Give rebuilt search boxes focus and caret back using prevSlot. */
+  /**
+   * Give the rebuilt search box for {@link prevSlot} its focus and caret back.
+   *
+   * Reads only module state and the freshly built input's own value; it
+   * deliberately has no access to the render body that recorded the intent,
+   * which has already returned. A slot that this frame did not build (the
+   * loading frames render only the main search) is left alone rather than
+   * cleared, so the intent is honoured by the frame that does build it.
+   */
   const restoreSearchIntents = (root: HTMLElement): void => {
     if (!prevSlot) return
     const input = root.querySelector(`input[data-lt-search="${prevSlot}"]`)
     if (!(input instanceof HTMLInputElement)) return
+    // Nothing typed and nothing to put the caret after: an empty box at
+    // offset 0 is a freshly-clicked search field, and re-focusing it would
+    // steal focus back from whatever the reader has moved on to. A caret of 0
+    // in a NON-empty query still restores, because the empty-value half of the
+    // conjunction is what makes the skip safe.
     if (prevSlotCaret === 0 && input.value === '') return
     input.focus()
     try {
@@ -390,16 +450,7 @@ export function renderCharactersSection(options: {
   // Tag pickers (active filter + bulk assignment)
   // ---------------------------------------------------------------------
 
-    /**
-   * Text typed into the tag pickers.
-   *
-   * Pure view state: it filters options and is never a mutation, so it is kept
-   * at module scope to survive the shell's rebuild rather than living in the
-   * store's contract.
-   */
-  const pickerQueries = new Map<string, string>()
-
-  /** A chip shown with a remove control, for a selected key set. */
+    /** A chip shown with a remove control, for a selected key set. */
   const buildSelectableChip = (label: string, removeLabel: string, onRemove: () => void): HTMLElement => {
     const node = el('span', { class: 'lt-chip lt-chip--accent' })
     node.appendChild(el('span', { class: 'lt-chip__label' }, [label]))
@@ -542,6 +593,9 @@ export function renderCharactersSection(options: {
     if (matches.length > 0) body.appendChild(options)
 
     if (matches.length > shown) {
+      // Truncation drops OPTIONS only. The search box is built above and is
+      // never inside this block, so a reader typing here keeps the rebuilt box
+      // (and their caret) however far past the cap the result set runs.
       body.appendChild(
         el('p', { class: 'lt-state__detail' }, [
           `Showing ${shown} of ${matches.length} existing tags — refine your search to see the rest. ` +
@@ -1044,13 +1098,16 @@ export function renderCharactersSection(options: {
     if (destroyed) return
     const view = store.view
 
+    // Refresh the intent from the live DOM only when a search box really is
+    // focused right now. It must NOT be *cleared* otherwise: the shell mounts
+    // a section by destroying the old one and rendering a new one, so by the
+    // time this runs the outgoing input is already detached and
+    // `document.activeElement` is `<body>` even though the reader never left
+    // the search box. The `focus`/`blur` listeners own losing focus.
     const active = document.activeElement as HTMLInputElement | null
     if (active && active.dataset.ltSearch) {
-      prevSlot = active.dataset.ltSearch as string
+      prevSlot = active.dataset.ltSearch
       prevSlotCaret = active.selectionStart ?? active.value.length
-    } else {
-      prevSlot = null
-      prevSlotCaret = 0
     }
 
     teardown()
@@ -1113,11 +1170,14 @@ export function renderCharactersSection(options: {
       if (destroyed) return
       destroyed = true
       teardown()
-      // Focus intent is dropped so a torn-down panel never steals focus back;
-      // the pickers' typed text is deliberately KEPT, because `destroy()` runs
-      // on every shell rebuild and clearing it would wipe what the user typed.
-      prevSlot = null
-      prevSlotCaret = 0
+      // Focus intent, caret and the pickers' typed text are deliberately KEPT:
+      // `destroy()` IS the shell's re-render path (it mounts a section by
+      // releasing the old one and rendering a new one), so this panel's search
+      // box is normally torn down while the reader is still typing in it.
+      // Clearing here would make the module header's invariant unachievable —
+      // focus would drop on every store commit, i.e. about a second after
+      // typing stops, when the search debounce fires. Genuine focus loss is
+      // recorded by the `blur` listener in `buildSearch`.
       clear(container)
     },
   }

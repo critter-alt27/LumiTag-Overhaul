@@ -61,6 +61,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * A `{ id, tags }` entry is only useful if BOTH halves are well-formed: an
+ * entry with a missing id cannot be matched to a character, and one with a
+ * non-array `tags` would silently verify a write against nothing.
+ */
+function isCharacterTagsArray(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry) =>
+        isRecord(entry) && typeof entry.id === 'string' && Array.isArray((entry.tags as unknown) as unknown),
+    )
+  )
+}
+
+/** A per-item failure must carry the full triple the frontend classifies on. */
+function isBatchFailureArray(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry) =>
+        isRecord(entry) &&
+        typeof entry.characterId === 'string' &&
+        typeof entry.code === 'string' &&
+        typeof entry.message === 'string' &&
+        typeof entry.retryable === 'boolean',
+    )
+  )
+}
+
+/**
  * Validates a backend reply's shape against the response type the caller asked
  * for. A reply whose `type` disagrees with the request is a protocol violation,
  * not a legitimate answer, so it is rejected rather than returned.
@@ -85,6 +115,14 @@ function isWellFormedFor(response: Record<string, unknown>, expectedType: Backen
       return response.type === 'characters.get.result' && 'character' in response
     case 'characters.updateTags.result':
       return response.type === 'characters.updateTags.result' && response.character !== null
+    case 'characters.updateTagsBatch.result':
+      return (
+        response.type === 'characters.updateTagsBatch.result' &&
+        isCharacterTagsArray(response.updated) &&
+        isBatchFailureArray(response.failures)
+      )
+    case 'characters.getBatch.result':
+      return response.type === 'characters.getBatch.result' && isCharacterTagsArray(response.characters)
     case 'error':
       return typeof response.code === 'string' && typeof response.message === 'string'
     default:
@@ -268,6 +306,10 @@ function expectedResponseType(requestType: BackendRequest['type']): BackendRespo
       return 'characters.get.result'
     case 'characters.updateTags':
       return 'characters.updateTags.result'
+    case 'characters.updateTagsBatch':
+      return 'characters.updateTagsBatch.result'
+    case 'characters.getBatch':
+      return 'characters.getBatch.result'
     default:
       return 'error'
   }

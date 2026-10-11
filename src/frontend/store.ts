@@ -18,12 +18,13 @@
  *     by a re-read of exactly the affected characters, so a failed write
  *     leaves its chip visible instead of silently dropping it.
  *  4. **Never re-fetch the whole library after a write.** `refresh()` re-reads
- *     only the ids the executor actually touched.
+ *     only the ids the executor actually touched — and only their tag arrays,
+ *     merged into the records already held (see `patchCharacterTags`).
  *  5. **Every operation produces a report**, including a fully successful one,
  *     so the user always gets a result confirmation.
  */
 
-import type { LumiTagCharacter } from '../shared/types'
+import type { CharacterTags, LumiTagCharacter } from '../shared/types'
 import { searchCharactersWithContext } from './search/evaluator'
 import type { ParsedQuery, QuerySyntaxError } from './search/parser'
 import { parseQuery } from './search/parser'
@@ -384,16 +385,19 @@ export class TagManagerStore {
    * executor touched, so re-reading them and rebuilding the index keeps the
    * catalog truthful without paying for the whole library.
    */
-  async refresh(affectedIds?: readonly string[]): Promise<void> {
+  async refresh(
+    affectedIds?: readonly string[],
+    options: { deferSuccessCommit?: boolean } = {},
+  ): Promise<void> {
     const ids = [...new Set((affectedIds ?? []).filter((id) => typeof id === 'string' && id !== ''))]
     if (ids.length === 0) return
 
     this.state.isRefreshing = true
     this.commit()
 
-    let updated: Map<string, LumiTagCharacter>
+    let updated: Map<string, CharacterTags>
     try {
-      updated = await this.repo.getCharactersByIds(ids)
+      updated = await this.repo.getTagsBatch(ids)
     } catch (error) {
       if (this.disposed) return
       this.state.isRefreshing = false
@@ -406,9 +410,44 @@ export class TagManagerStore {
     if (this.disposed) return
 
     this.state.isRefreshing = false
-    if (updated.size > 0) this.patchCharacters(updated)
+    this.patchCharacterTags(updated)
     this.state.lastRefreshedAt = Date.now()
-    this.commit()
+    if (!options.deferSuccessCommit) {
+      this.commit()
+    }
+  }
+
+  /**
+   * Merge a tags-only read into the records already held.
+   *
+   * Deliberately NOT `patchCharacters`: a batch read carries `{ id, tags }`, so
+   * replacing a whole record with it would blank out every field the store does
+   * not re-read — `name`, `description`, the rest — which is data loss wearing
+   * the costume of a fresh read. Merging takes the one thing a bulk write can
+   * actually have changed and leaves the body exactly as loaded.
+   *
+   * An id the backend could not read is left untouched, which is the same
+   * honest outcome a failed re-read has always had: the previously known value
+   * stands. An id the store has never loaded is skipped rather than appended,
+   * because a tags-only payload has no body to merge into and appending one
+   * would invent a nameless character.
+   */
+  private patchCharacterTags(updated: ReadonlyMap<string, CharacterTags>): void {
+    if (updated.size === 0) return
+
+    const next = this.state.characters.slice()
+    const positions = new Map<string, number>()
+    for (let i = 0; i < next.length; i++) positions.set((next[i] as LumiTagCharacter).id, i)
+
+    for (const [id, tagsOnly] of updated) {
+      const at = positions.get(id)
+      if (at === undefined) continue
+      next[at] = { ...(next[at] as LumiTagCharacter), tags: [...tagsOnly.tags] }
+    }
+
+    this.state.characters = next
+    this.state.tagIndex = buildTagIndex(next)
+    this.pruneSelections()
   }
 
   /** Replace changed records in place and rebuild the derived index. */
@@ -473,7 +512,12 @@ export class TagManagerStore {
   private async runPlan(input: PlanInput): Promise<void> {
     const preview = planOperation(this.state.characters, input)
     const report = await this.executor.execute(preview)
-    await this.refresh(report.results.map((r) => r.characterId))
+    // The report publication below is the final commit for this operation.
+    // Defer the successful refresh commit so we don't compute/publish the full
+    // derived view twice back-to-back after a mutation.
+    await this.refresh(report.results.map((r) => r.characterId), {
+      deferSuccessCommit: true,
+    })
     if (this.disposed) return
     this.addReport(report, true)
   }
@@ -502,7 +546,9 @@ export class TagManagerStore {
     const report = this.state.reports.find((r) => r.opId === opId)
     if (!report) return
     const updated = await pick(report)
-    await this.refresh(updated.results.map((r) => r.characterId))
+    await this.refresh(updated.results.map((r) => r.characterId), {
+      deferSuccessCommit: true,
+    })
     if (this.disposed) return
     this.addReport(updated, true)
   }
@@ -1066,7 +1112,10 @@ function chipRemovalFailure(
   const opId = `chip-remove-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   const name = readName(character)
   const result: MutationResult = {
-    mutationId: `${opId}:${character.id}:${tagKey(tag)}`,
+    // Same derivation as the planner's `mutationId` (opId + characterId), so
+    // this hand-built record is indistinguishable from a planned one to every
+    // id-keyed consumer: `findResult`, the in-flight retry map, group retry.
+    mutationId: `${opId}:${character.id}`,
     characterId: character.id,
     characterName: name,
     op: 'remove',

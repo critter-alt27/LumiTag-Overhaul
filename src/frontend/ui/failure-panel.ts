@@ -24,6 +24,13 @@
  *  6. **Reports are in-memory.** There is no storage API anywhere in
  *     `src/frontend/`, so the panel says the report is lost on close or reload
  *     rather than implying that it is persisted.
+ *  7. **A truncated list is never silent.** At most {@link FAILURE_ROW_LIMIT}
+ *     rows per group are rendered, and every truncation — rows and tag names —
+ *     is stated in the visible text, because a capped list that looks complete
+ *     is how a user concludes that a character they expected to see was never
+ *     attempted. Truncation removes rows, never reachability: the group retry,
+ *     "Retry All Remaining Failures" and the full summary all still cover every
+ *     failure in the report, rendered or not.
  *
  * Listener discipline: the panel attaches NO listener that outlives a render.
  * Every control is rebuilt from scratch each time, so its handler dies with
@@ -45,6 +52,23 @@ import { button, clear, el, emptyState, setBusy, text } from './dom'
 // ---------------------------------------------------------------------------
 // Presentation helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Hard cap on eagerly rendered failure rows, per group.
+ *
+ * The whole panel is rebuilt from scratch on every store commit, and a failure
+ * row is heavier than a character row — four cells, a retry button and its
+ * listener. A 300-character bulk delete where every write fails would otherwise
+ * rebuild 300 such rows on every progress emission, which on the Termux WebView
+ * is what turns a report into an unresponsive panel. 300 mirrors
+ * `characters-section`'s `ROW_LIMIT`: past that, a reader is not scrolling a
+ * list to find one character anyway, they are reading the summary and
+ * retrying — which the buttons above the table still do for every failure.
+ */
+const FAILURE_ROW_LIMIT = 300
+
+/** How many tag names the header badge names before it counts the rest. */
+const TAG_SUMMARY_LIMIT = 12
 
 /** Human op names, used to build the group headings (`Merge: Mage → Magic`). */
 const OP_LABELS: Record<string, string> = {
@@ -107,10 +131,15 @@ function hasRetryingResult(report: OperationReport): boolean {
   return report.results.some((r) => r.state === 'retrying')
 }
 
-/** The tags a report touched, capped so a 200-tag merge cannot break the row. */
+/**
+ * The tags a report touched, capped so a 200-tag merge cannot break the row.
+ *
+ * The `+N more` suffix is what keeps the cap honest: the badge never presents a
+ * truncated tag list as the whole one.
+ */
 function tagSummary(report: OperationReport): string {
   if (report.tags.length === 0) return '—'
-  const shown = report.tags.slice(0, 12)
+  const shown = report.tags.slice(0, TAG_SUMMARY_LIMIT)
   const rest = report.tags.length - shown.length
   return rest > 0 ? `${shown.join(', ')} +${rest} more` : shown.join(', ')
 }
@@ -188,9 +217,9 @@ function renderFailureRow(failure: MutationResult, callbacks: RowCallbacks): HTM
 /**
  * One failure group as a real `<table>`.
  *
- * The heading is the SPECIFIC tag change, so a failed `Elf` removal and a failed
- * `Dark` removal are never conflated — even when they belong to the same
- * character.
+ * The heading is the SPECIFIC tag change, so two different removals are never
+ * conflated. A collapsed multi-tag record names every source it removed, so the
+ * group still says `Dark, Elf` rather than collapsing to one tag.
  */
 function renderGroupTable(
   group: FailureGroup,
@@ -208,32 +237,36 @@ function renderGroupTable(
   )
   heading.appendChild(el('span', { class: 'lt-failures__spacer' }))
 
-  const retryGroupButton = button(
+  const retryGroupLabel =
     retryable.length === 0
       ? 'Not retryable'
       : retryable.length === 1
         ? 'Retry this change'
-        : `Retry ${retryable.length} failed`,
-    {
-      variant: 'default',
-      ariaLabel: `Retry the remaining failures for ${group.label}`,
-      disabled: retryable.length === 0 || callbacks.busy,
-      onClick: () => {
-        if (callbacks.busy) return
-        callbacks.retryGroup(group.key)
-      },
+        : `Retry ${retryable.length} failed`
+  const retryGroupButton = button(retryGroupLabel, {
+    variant: 'default',
+    ariaLabel: `Retry the remaining failures for ${group.label}`,
+    disabled: retryable.length === 0 || callbacks.busy,
+    onClick: () => {
+      if (callbacks.busy) return
+      callbacks.retryGroup(group.key)
     },
-  )
+  })
   if (retryable.length === 0) {
     retryGroupButton.title = 'None of these failures can be retried — see the reason on each row.'
   }
   heading.appendChild(retryGroupButton)
   wrap.appendChild(heading)
 
+  const shown = Math.min(group.failures.length, FAILURE_ROW_LIMIT)
   const table = el('table', { style: 'width:100%;border-collapse:collapse;' })
   table.appendChild(
     el('caption', { class: 'lt-visually-hidden' }, [
-      `Failed ${opLabel(group.op).toLowerCase()} of ${group.label}, one row per character`,
+      shown === group.failures.length
+        ? `Failed ${opLabel(group.op).toLowerCase()} of ${group.label}, one row per character`
+        : `Failed ${opLabel(group.op).toLowerCase()} of ${group.label}, the first ${shown} of ` +
+          `${group.failures.length} failed characters. The rest are listed in the full summary and are ` +
+          'still covered by the retry button above.',
     ]),
   )
 
@@ -251,7 +284,7 @@ function renderGroupTable(
   table.appendChild(thead)
 
   const tbody = el('tbody')
-  for (const failure of group.failures) {
+  for (const failure of group.failures.slice(0, shown)) {
     tbody.appendChild(
       renderFailureRow(failure, {
         busy: callbacks.busy || failure.state === 'retrying',
@@ -261,6 +294,18 @@ function renderGroupTable(
   }
   table.appendChild(tbody)
   wrap.appendChild(table)
+
+  if (shown < group.failures.length) {
+    // The hidden rows are counted in `retryable`, so the group button above
+    // still retries every one of them — the cap hides rows, never failures.
+    wrap.appendChild(
+      el('p', { class: 'lt-state__detail' }, [
+        `Showing ${shown} of ${group.failures.length} failed characters. The ${group.failures.length - shown} not ` +
+          `listed are still retried by “${retryGroupLabel}” and by “Retry All Remaining Failures”, and every one of ` +
+          'them is named in the full summary below.',
+      ]),
+    )
+  }
 
   return wrap
 }

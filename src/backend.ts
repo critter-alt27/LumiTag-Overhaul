@@ -5,6 +5,9 @@
  *  - DTO normalization (`normalizeCharacter` / `normalizeCharacterTags`)
  *  - pagination clamping (host hard-caps `characters.list` at 200/page)
  *  - error classification into `{ code, message, retryable }`
+ *  - the bulk transport, which writes many characters from ONE message and
+ *    answers with `{ id, tags }` only — a bulk edit must never cost one
+ *    message-channel round trip per character
  *
  * It never trusts its input: every field of every inbound message is validated
  * before use, because the frontend transport is not a trusted boundary.
@@ -20,12 +23,13 @@
  * carries no userId.
  */
 
-import { normalizeCharacter, normalizeCharacterTags } from './shared/normalize'
+import { normalizeCharacter, normalizeCharacterTags, normalizeCharacterTagsOnly } from './shared/normalize'
 import {
   BACKEND_ERROR_NOT_FOUND,
   BACKEND_ERROR_TIMEOUT,
   BACKEND_ERROR_UNAVAILABLE,
   type BackendResponse,
+  type BatchFailure,
 } from './shared/protocol'
 import { BACKEND_PAGE_LIMIT } from './shared/types'
 
@@ -279,6 +283,143 @@ async function handleUpdateTags(payload: Record<string, unknown>, userId: string
   }
 }
 
+/**
+ * Validate and normalize one inbound batch write entry.
+ *
+ * Returns the entry ready to hand the host, or the failure that must be
+ * reported for it. Malformed items are per-ITEM failures rather than a rejected
+ * request: the caller sent a batch, and one unusable entry must not cost the
+ * other characters their write.
+ */
+function readBatchUpdate(entry: unknown):
+  | { characterId: string; tags: string[] }
+  | { failure: BatchFailure } {
+  if (!isRecord(entry)) {
+    return { failure: { characterId: '', code: ERROR_INVALID_INPUT, message: 'Each update must be an object', retryable: false } }
+  }
+  const characterId = entry.characterId
+  if (typeof characterId !== 'string' || characterId.length === 0) {
+    return { failure: { characterId: '', code: ERROR_INVALID_INPUT, message: 'Each update requires a non-empty characterId', retryable: false } }
+  }
+  if (!Array.isArray(entry.tags)) {
+    return { failure: { characterId, code: ERROR_INVALID_INPUT, message: 'Each update requires a tags array', retryable: false } }
+  }
+  // Normalized BEFORE the write: `tags` is a full-array replace on the host, so
+  // storing un-normalized values would persist duplicates/case variants that the
+  // tag index and query evaluator would then disagree about.
+  return { characterId, tags: normalizeCharacterTags(entry.tags) }
+}
+
+/**
+ * Bulk tag replace: ONE request in, ONE reply out, N host writes.
+ *
+ * The host loop is sequential by design. The host serializes character writes
+ * internally, so issuing them concurrently buys nothing and only deepens the
+ * request queue the WebView host has to keep alive — the exact pressure that
+ * made large bulk edits unreliable.
+ *
+ * Partial-success is the contract: each item is written inside its own
+ * try/catch, so a character deleted mid-operation, or a single host rejection,
+ * is recorded as a `failures[]` entry while every other character still lands.
+ * Exactly one reply is sent, at the end, carrying both halves.
+ */
+async function handleUpdateTagsBatch(payload: Record<string, unknown>, userId: string): Promise<void> {
+  const requestId = recoverRequestId(payload)
+  if (!requestId) return
+
+  const scopedUserId = requireUserId(requestId, userId)
+  if (!scopedUserId) return
+
+  if (!Array.isArray(payload.updates)) {
+    sendError(requestId, userId, {
+      code: ERROR_INVALID_INPUT,
+      message: 'characters.updateTagsBatch requires an updates array',
+      retryable: false,
+    })
+    return
+  }
+
+  const failures: BatchFailure[] = []
+  const updates: { characterId: string; tags: string[] }[] = []
+  for (const entry of payload.updates) {
+    const parsed = readBatchUpdate(entry)
+    if ('failure' in parsed) failures.push(parsed.failure)
+    else updates.push({ characterId: parsed.characterId, tags: parsed.tags })
+  }
+
+  const updated: { id: string; tags: string[] }[] = []
+  for (const update of updates) {
+    try {
+      const character = await spindle.characters.update(update.characterId, { tags: update.tags }, scopedUserId)
+      // The `id` here is a CORRELATION KEY, not the host's echo of itself: the
+      // frontend matches each `updated` entry back to the character it asked to
+      // write, and anything that fails to match is reported as an unknown
+      // outcome rather than a success. Keying by `character.id` would let a host
+      // that omits or misnames the field desynchronise every downstream
+      // verification while still looking like a clean reply. `update.characterId`
+      // is the id we validated above and handed to the host, so it is the only
+      // id in this function that is guaranteed to be ours.
+      updated.push({ id: update.characterId, tags: normalizeCharacterTagsOnly(character).tags })
+    } catch (err) {
+      failures.push({ characterId: update.characterId, ...classifyError(err) })
+    }
+  }
+
+  spindle.sendToFrontend(
+    { type: 'characters.updateTagsBatch.result', requestId, updated, failures } satisfies BackendResponse,
+    userId,
+  )
+}
+
+/**
+ * Bulk tags read: ONE request in, ONE reply out, N host reads.
+ *
+ * Partial-success again: a character that has since been deleted is simply
+ * absent from the reply. Ids that are not non-empty strings cannot name a
+ * record and are dropped without a host call — they are a guaranteed miss, not
+ * a failure, and calling the host for them would only waste its queue.
+ */
+async function handleGetBatch(payload: Record<string, unknown>, userId: string): Promise<void> {
+  const requestId = recoverRequestId(payload)
+  if (!requestId) return
+
+  const scopedUserId = requireUserId(requestId, userId)
+  if (!scopedUserId) return
+
+  if (!Array.isArray(payload.characterIds)) {
+    sendError(requestId, userId, {
+      code: ERROR_INVALID_INPUT,
+      message: 'characters.getBatch requires a characterIds array',
+      retryable: false,
+    })
+    return
+  }
+
+  const ids: string[] = []
+  for (const id of payload.characterIds) {
+    if (typeof id !== 'string' || id.length === 0) continue
+    if (!ids.includes(id)) ids.push(id)
+  }
+
+  const characters: { id: string; tags: string[] }[] = []
+  for (const id of ids) {
+    try {
+      const character = await spindle.characters.get(id, scopedUserId)
+      if (character === null || character === undefined) continue
+      characters.push(normalizeCharacterTagsOnly(character))
+    } catch {
+      // A character that cannot be read is simply left out; the caller treats
+      // a missing id as "unchanged", which is the honest reading of a read that
+      // did not happen.
+    }
+  }
+
+  spindle.sendToFrontend(
+    { type: 'characters.getBatch.result', requestId, characters } satisfies BackendResponse,
+    userId,
+  )
+}
+
 spindle.onFrontendMessage((payload: unknown, userId: string) => {
   if (!isRecord(payload)) {
     // Nothing to correlate a reply to; drop it.
@@ -295,6 +436,12 @@ spindle.onFrontendMessage((payload: unknown, userId: string) => {
       return
     case 'characters.updateTags':
       void handleUpdateTags(payload, userId)
+      return
+    case 'characters.updateTagsBatch':
+      void handleUpdateTagsBatch(payload, userId)
+      return
+    case 'characters.getBatch':
+      void handleGetBatch(payload, userId)
       return
     default: {
       // Malformed/unknown message: reply with an error only if we can correlate

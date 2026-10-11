@@ -6,6 +6,8 @@ import {
   computeTotals,
   deriveStatus,
   failureDisplayName,
+  failureGroupKey,
+  failureGroupLabel,
   groupFailures,
   isFailure,
   isResolved,
@@ -252,6 +254,85 @@ describe('groupFailures', () => {
   test('conflict mutations are grouped as failures too', () => {
     const report = reportOf([result('conflict', { tag: 'Elf', characterId: 'c1' })])
     expect(groupFailures(report).map((g) => g.key)).toEqual(['elf'])
+  })
+
+  test('a collapsed multi-source remove labels ALL its sources, not just the primary', () => {
+    // One character, ONE write that removed both tags: it must not read as a
+    // single-tag failure.
+    const report = reportOf([
+      result('failed', {
+        op: 'remove',
+        tag: 'Dark',
+        sourceTags: ['Elf', 'Dark'],
+        removedTags: ['Elf', 'Dark'],
+        characterId: 'c1',
+      }),
+    ])
+    const groups = groupFailures(report)
+    expect(groups).toHaveLength(1)
+    expect(groups[0]?.key).toBe('dark+elf')
+    expect(groups[0]?.label).toBe('Dark, Elf')
+  })
+
+  test('the group key is the full source SET, so differing sets never merge', () => {
+    const report = reportOf([
+      result('failed', { op: 'remove', tag: 'Elf', sourceTags: ['Elf'], characterId: 'c1' }),
+      result('failed', { op: 'remove', tag: 'Dark', sourceTags: ['Elf', 'Dark'], characterId: 'c2' }),
+    ])
+    // Different sets = different writes = different retry scopes.
+    expect(groupFailures(report).map((g) => g.key).sort()).toEqual(['dark+elf', 'elf'])
+  })
+
+  test('characters sharing one source set collapse into a single group', () => {
+    const report = reportOf([
+      result('failed', { op: 'remove', tag: 'Elf', sourceTags: ['Elf', 'Dark'], characterId: 'c1' }),
+      result('failed', { op: 'remove', tag: 'Dark', sourceTags: ['Dark', 'Elf'], characterId: 'c2' }),
+    ])
+    const groups = groupFailures(report)
+    expect(groups).toHaveLength(1)
+    expect(groups[0]?.failures.map((f) => f.characterId)).toEqual(['c1', 'c2'])
+  })
+
+  test('a collapsed merge group labels every source against the destination', () => {
+    const report = reportOf(
+      [
+        result('failed', {
+          op: 'merge',
+          tag: 'Dark',
+          destTag: 'Magic',
+          sourceTags: ['Mage', 'Dark', 'Elf'],
+          characterId: 'c1',
+        }),
+        result('failed', {
+          op: 'merge',
+          tag: 'Dark',
+          destTag: 'Magic',
+          sourceTags: ['Mage', 'Dark', 'Elf'],
+          characterId: 'c2',
+        }),
+      ],
+      { op: 'merge', tags: ['Magic', 'Mage', 'Dark', 'Elf'] },
+    )
+    const groups = groupFailures(report)
+    expect(groups).toHaveLength(1)
+    expect(groups[0]?.key).toBe('dark+elf+mage->magic')
+    expect(groups[0]?.label).toBe('Dark, Elf, Mage → Magic')
+    expect(groups[0]?.failures).toHaveLength(2)
+  })
+
+  test('the group key does not depend on sourceTags order or case', () => {
+    const a = result('failed', { op: 'remove', tag: 'Elf', sourceTags: ['Elf', 'Dark'] })
+    const b = result('failed', { op: 'remove', tag: 'elf', sourceTags: ['dark', 'ELF'] })
+    expect(failureGroupKey(a)).toBe(failureGroupKey(b))
+    expect(failureGroupLabel(a)).toBe('Dark, Elf')
+  })
+
+  test('an empty sourceTags falls back to the primary tag', () => {
+    // The chip-removal report is hand-built and leaves sourceTags as the
+    // character's full list; a result with nothing usable still groups.
+    const bare = result('failed', { op: 'remove', tag: 'Elf', sourceTags: [] })
+    expect(failureGroupKey(bare)).toBe('elf')
+    expect(failureGroupLabel(bare)).toBe('Elf')
   })
 })
 

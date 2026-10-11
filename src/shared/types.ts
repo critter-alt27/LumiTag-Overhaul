@@ -20,6 +20,21 @@ export interface CharacterListPage {
 }
 
 /**
+ * The tags-only projection of a character, used by every BATCH transport.
+ *
+ * A bulk edit of N characters used to pay for 2N full character DTOs crossing
+ * the message channel, and it is the bulky prompt fields (`description`,
+ * `personality`, `scenario`, `creator_notes`, `system_prompt`) that dominate
+ * that cost. Batch replies therefore carry this shape and never a
+ * `LumiTagCharacter`: nothing in the batch path reads, writes or renders the
+ * prompt body, so shipping it would be pure payload for no behaviour.
+ */
+export interface CharacterTags {
+  id: string
+  tags: string[]
+}
+
+/**
  * Fields exposed to the `A:` (any-field) search operator. This list is the
  * documented contract for `A:` — the UI help panel renders it verbatim, so
  * users always know exactly which fields a bare `A:` query can reach.

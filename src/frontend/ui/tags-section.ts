@@ -67,14 +67,30 @@ const MODE_BUTTONS: readonly { mode: TagMode; label: string; title: string }[] =
 ]
 
 /**
- * Whether the rebuilt search box should take focus back after a re-render.
+ * Focus and caret intent for the rebuilt tag search box.
  *
  * The shell rebuilds the panel from scratch on every store change, which would
  * otherwise drop focus (and the caret) on every keystroke. There is only ever
- * one Tags panel, so module-level intent is enough.
+ * one Tags panel and one search box in it, so module-level intent is enough —
+ * and it MUST be module-level: {@link restoreSearchFocus} runs after the render
+ * body that recorded this intent has already returned, so a render-scoped
+ * snapshot would be out of scope by the time it is read.
+ *
+ * Written by the search box's `focus`/`blur`/`keyup`/`select` listeners and
+ * refreshed from the live DOM at the top of `render()`; {@link destroy} must not
+ * clear it, because destroying this panel is how the shell performs a re-render.
  */
 let searchFocusIntent = false
+
+/**
+ * Caret offset of the focused search box, or `0` when nothing is focused.
+ *
+ * Always gated by {@link searchFocusIntent}, so a stale offset can never
+ * restore a caret the reader is no longer typing at.
+ */
 let searchCaret = 0
+
+/** Pending debounce for the 1000ms search commit. Survives a re-render on purpose. */
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 
 /** Session-authenticated, read-only avatar endpoint for a character. */
@@ -182,14 +198,22 @@ export function renderTagsSection(options: {
     )
     track(
       on(input, 'blur', () => {
-        searchFocusIntent = false
+        // A detached node also blurs, and the shell detaches this input on
+        // every rebuild, so a blur from a node that has left the document is
+        // the panel being replaced — not the reader moving on — and the intent
+        // must outlive it. (Within this renderer `teardown()` always runs
+        // before the detach, so this guard only ever sees host-driven teardown;
+        // it is kept because that case has no other writer.)
+        if (input.isConnected) searchFocusIntent = false
       }),
     )
-    track(
-      on(input, 'keyup', () => {
-        searchCaret = input.selectionStart ?? input.value.length
-      }),
-    )
+    // `keyup` alone misses a caret moved by clicking in the box or by
+    // select-all, so `select` keeps the offset exact on every re-render.
+    const recordCaret = (): void => {
+      searchCaret = input.selectionStart ?? input.value.length
+    }
+    track(on(input, 'keyup', recordCaret))
+    track(on(input, 'select', recordCaret))
     return input
   }
 
@@ -243,15 +267,26 @@ export function renderTagsSection(options: {
     return bar
   }
 
-  /** Give the rebuilt search box its focus and caret back after a re-render. */
+  /**
+   * Give the rebuilt search box its focus and caret back after a re-render.
+   *
+   * Reads only module state ({@link searchFocusIntent}, {@link searchCaret}) and
+   * the freshly built input's own value; it deliberately has no access to the
+   * render body that recorded the intent, which has already returned.
+   */
   const restoreSearchFocus = (root: HTMLElement): void => {
     if (!searchFocusIntent) return
     const input = root.querySelector('input.lt-search')
     if (!(input instanceof HTMLInputElement)) return
-    if (prevValue === '' && prevCaret === 0) return
+    // Nothing typed and nothing to put the caret after: an empty box at
+    // offset 0 is a freshly-clicked search field, and re-focusing it would
+    // steal focus back from whatever the reader has moved on to. A caret of 0
+    // in a NON-empty query still restores, because the empty-value half of the
+    // conjunction is what makes the skip safe.
+    if (searchCaret === 0 && input.value === '') return
     input.focus()
     try {
-      const caret = Math.min(prevCaret, input.value.length)
+      const caret = Math.min(searchCaret, input.value.length)
       input.setSelectionRange(caret, caret)
     } catch {
       // Some engines reject selection APIs on `type="search"`; focus alone
@@ -726,13 +761,19 @@ export function renderTagsSection(options: {
     if (destroyed) return
     const view = store.view
 
-    const active = document.activeElement as HTMLInputElement | null
-    const wasFocused = active?.classList.contains('lt-search')
-    const prevValue = wasFocused ? active.value : ''
-    const prevCaret = wasFocused ? (active.selectionStart ?? 0) : 0
-    const prevEnd = wasFocused ? (active.selectionEnd ?? 0) : 0
-    searchFocusIntent = wasFocused
-    searchCaret = prevCaret
+    // Refresh the intent from the live DOM only when the search box really is
+    // focused right now. It must NOT be *cleared* otherwise: the shell mounts
+    // a section by destroying the old one and rendering a new one, so by the
+    // time this runs the outgoing input is already detached and
+    // `document.activeElement` is `<body>` even though the reader never left
+    // the search box. The `focus`/`blur` listeners own losing focus. Narrowing
+    // is done on `active` itself rather than through a `wasFocused` boolean,
+    // because a boolean alias does not carry the null-exclusion to its uses.
+    const active = document.activeElement
+    if (active instanceof HTMLInputElement && active.classList.contains('lt-search')) {
+      searchFocusIntent = true
+      searchCaret = active.selectionStart ?? active.value.length
+    }
 
     teardown()
     clear(container)
@@ -755,6 +796,10 @@ export function renderTagsSection(options: {
     if (view.loadState === 'loading') {
       root.appendChild(spinner('Loading tags…'))
       container.appendChild(root)
+      // The loading frame still rebuilds the search box, so it owes it the
+      // same focus/caret restoration as the full frame — otherwise a refresh
+      // landing mid-word drops focus on every store change.
+      restoreSearchFocus(root)
       return
     }
 
@@ -777,9 +822,14 @@ export function renderTagsSection(options: {
     destroy: (): void => {
       if (destroyed) return
       destroyed = true
-      searchFocusIntent = false
       teardown()
       clear(container)
+      // Focus intent and caret are deliberately KEPT: `destroy()` IS the
+      // shell's re-render path (it mounts a section by releasing the old one
+      // and rendering a new one), so this panel's search box is normally torn
+      // down while the reader is still typing in it. Clearing here would make
+      // the module header's invariant unachievable. Genuine focus loss is
+      // recorded by the `blur` listener above.
     },
   }
 }
