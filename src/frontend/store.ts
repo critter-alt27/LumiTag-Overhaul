@@ -385,7 +385,10 @@ export class TagManagerStore {
    * executor touched, so re-reading them and rebuilding the index keeps the
    * catalog truthful without paying for the whole library.
    */
-  async refresh(affectedIds?: readonly string[]): Promise<void> {
+  async refresh(
+    affectedIds?: readonly string[],
+    options: { deferSuccessCommit?: boolean } = {},
+  ): Promise<void> {
     const ids = [...new Set((affectedIds ?? []).filter((id) => typeof id === 'string' && id !== ''))]
     if (ids.length === 0) return
 
@@ -409,7 +412,9 @@ export class TagManagerStore {
     this.state.isRefreshing = false
     this.patchCharacterTags(updated)
     this.state.lastRefreshedAt = Date.now()
-    this.commit()
+    if (!options.deferSuccessCommit) {
+      this.commit()
+    }
   }
 
   /**
@@ -507,7 +512,12 @@ export class TagManagerStore {
   private async runPlan(input: PlanInput): Promise<void> {
     const preview = planOperation(this.state.characters, input)
     const report = await this.executor.execute(preview)
-    await this.refresh(report.results.map((r) => r.characterId))
+    // The report publication below is the final commit for this operation.
+    // Defer the successful refresh commit so we don't compute/publish the full
+    // derived view twice back-to-back after a mutation.
+    await this.refresh(report.results.map((r) => r.characterId), {
+      deferSuccessCommit: true,
+    })
     if (this.disposed) return
     this.addReport(report, true)
   }
@@ -536,7 +546,9 @@ export class TagManagerStore {
     const report = this.state.reports.find((r) => r.opId === opId)
     if (!report) return
     const updated = await pick(report)
-    await this.refresh(updated.results.map((r) => r.characterId))
+    await this.refresh(updated.results.map((r) => r.characterId), {
+      deferSuccessCommit: true,
+    })
     if (this.disposed) return
     this.addReport(updated, true)
   }

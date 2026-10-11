@@ -98,16 +98,6 @@ export interface ExecuteHooks {
   onResult?: (result: MutationResult) => void
 }
 
-/**
- * Pause between per-character writes to reduce sustained load on lower-end hosts.
- * Tune this value (milliseconds) when testing device stability.
- */
-export const INTER_CHARACTER_DELAY_MS = 500
-
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 const TIMEOUT_PATTERN = /timeout|timed out|network|fetch failed|aborted/i
 const FORBIDDEN_PATTERN = /permission|forbidden|unauthorized|not granted/i
 const NOT_FOUND_PATTERN = /not found|404|no such character|deleted/i
@@ -450,66 +440,76 @@ export class MutationExecutor {
       batches.push({ id: first.characterId, tags: dedupeTagNames(first.targetTags), muts })
     }
 
-    // Write one character at a time instead of sending the entire operation
-    // as one large request. The delay gives the host/device breathing room
-    // between writes; each character still receives one atomic tag-array update.
-    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-      const batch = batches[batchIndex] as (typeof batches)[number]
-      let response: Awaited<ReturnType<CharacterMutationPort['updateTagsBatch']>> | null = null
-
+    if (batches.length > 0) {
+      let outcome: { tagsById: Map<string, string[]>; failures: Map<string, BatchFailure> } | null = null
       try {
-        response = await this.port.updateTagsBatch([
-          { characterId: batch.id, tags: batch.tags },
-        ])
-      } catch (error) {
-        const classified = classifyError(error)
-        for (const m of batch.muts) {
-          const result = index.get(m.mutationId)
-          if (result) this.markFailure(result, classified)
+        // ONE request for the whole operation, and ONLY tag arrays — never a
+        // full-character snapshot.
+        const response = await this.port.updateTagsBatch(
+          batches.map((b) => ({ characterId: b.id, tags: b.tags })),
+        )
+        outcome = {
+          tagsById: new Map(response.updated.map((entry) => [entry.id, entry.tags])),
+          failures: new Map(response.failures.map((failure) => [failure.characterId, failure])),
         }
-      }
-
-      if (response !== null) {
-        const failure = response.failures.find((item) => item.characterId === batch.id)
-        if (failure) {
-          const classified = classifyBatchFailure(failure)
+      } catch (error) {
+        // A transport-level failure means NOTHING in this batch is known to have
+        // landed, so every mutation it carried failed with that one error —
+        // exactly as it would have when each character was written separately.
+        const classified = classifyError(error)
+        for (const batch of batches) {
           for (const m of batch.muts) {
             const result = index.get(m.mutationId)
             if (result) this.markFailure(result, classified)
           }
-        } else {
-          const stored = response.updated.find((item) => item.id === batch.id)?.tags
-          if (stored === undefined) {
+        }
+      }
+
+      if (outcome !== null) {
+        for (const batch of batches) {
+          const failure = outcome.failures.get(batch.id)
+          if (failure) {
+            // A per-item failure fails ONLY that character's mutations, so the
+            // report can still name which tag change failed.
+            const classified = classifyBatchFailure(failure)
             for (const m of batch.muts) {
               const result = index.get(m.mutationId)
-              if (result) {
-                this.markFailure(result, {
-                  message: 'The host did not report this character back, so the change cannot be confirmed as saved.',
-                  code: 'unverified',
-                  retryable: true,
-                  uncertain: true,
-                })
-              }
+              if (result) this.markFailure(result, classified)
             }
           } else {
-            this.verifyWrite(index, batch.muts, stored)
+            const stored = outcome.tagsById.get(batch.id)
+            if (stored === undefined) {
+              // The host mentioned this character in NEITHER half of the reply:
+              // not as written, not as failed. That is not a success and not a
+              // failure — it is no evidence at all, which is what `uncertain`
+              // means. Falling back to the array we INTENDED to write would make
+              // `intentSatisfied` true by construction and report a write the
+              // host never confirmed. Marked retryable so the retry path re-reads
+              // the character and finds the truth either way.
+              for (const m of batch.muts) {
+                const result = index.get(m.mutationId)
+                if (result) {
+                  this.markFailure(result, {
+                    message: 'The host did not report this character back, so the change cannot be confirmed as saved.',
+                    code: 'unverified',
+                    retryable: true,
+                    uncertain: true,
+                  })
+                }
+              }
+            } else {
+              this.verifyWrite(index, batch.muts, stored)
+            }
           }
         }
       }
 
-      for (const m of batch.muts) {
-        const result = index.get(m.mutationId)
-        if (result) hooks?.onResult?.(cloneResult(result))
-      }
-      progress()
-
-      // No delay after the final character. A delay of zero is also useful
-      // when benchmarking and restores the old no-wait cadence.
-      if (
-        INTER_CHARACTER_DELAY_MS > 0 &&
-        batchIndex < batches.length - 1
-      ) {
-        await wait(INTER_CHARACTER_DELAY_MS)
+      for (const batch of batches) {
+        for (const m of batch.muts) {
+          const result = index.get(m.mutationId)
+          if (result) hooks?.onResult?.(cloneResult(result))
+        }
+        progress()
       }
     }
 
