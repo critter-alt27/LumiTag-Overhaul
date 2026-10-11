@@ -136,6 +136,7 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
   const restoreScroll = (top: number, body: HTMLElement): void => {
     if (top <= 0) return
     const max = Math.max(0, body.scrollHeight - body.clientHeight)
+    if (max === 0) return // don't force jump to 0 on shorter content
     body.scrollTop = Math.min(top, max)
   }
 
