@@ -93,30 +93,9 @@ const FILTER_OPTIONS: readonly { value: CharacterTagFilter; label: string }[] =
 /** Filter modes that consult the active tag-filter selection. */
 const TAG_AWARE_FILTERS: readonly CharacterTagFilter[] = ['any', 'all_of']
 
-/** A focus/caret intent for one of the rebuilt search boxes. */
-interface SearchIntent {
-  focused: boolean
-  caret: number
-}
-
-/**
- * Which rebuilt search box has focus, and where its caret was.
- *
- * The shell rebuilds this panel from scratch on every store change, which would
- * otherwise drop focus (and the caret) on every keystroke — and typing into the
- * character search is the single most common interaction here. Keyed by slot
- * name because this panel has three independent search boxes.
- */
-const searchIntents = new Map<string, SearchIntent>()
-
-function intentFor(slot: string): SearchIntent {
-  let intent = searchIntents.get(slot)
-  if (!intent) {
-    intent = { focused: false, caret: 0 }
-    searchIntents.set(slot, intent)
-  }
-  return intent
-}
+/** Previous focused search slot and caret for focus restoration. */
+let prevSlot: string | null = null
+let prevSlotCaret = 0
 
 /** Identity of one removable chip: character id plus tag key. Never a name. */
 function chipKey(characterId: string, tag: string): string {
@@ -306,38 +285,35 @@ export function renderCharactersSection(options: {
     track(on(input, 'input', () => onInput(input.value)))
     track(
       on(input, 'focus', () => {
-        intentFor(slot).focused = true
+        prevSlot = slot
       }),
     )
     track(
       on(input, 'blur', () => {
-        intentFor(slot).focused = false
+        prevSlot = null
       }),
     )
     track(
       on(input, 'keyup', () => {
-        intentFor(slot).caret = input.selectionStart ?? input.value.length
+        prevSlotCaret = input.selectionStart ?? input.value.length
       }),
     )
     return input
   }
 
-  /** Give every rebuilt search box its focus and caret back. */
+  /** Give rebuilt search boxes focus and caret back using prevSlot. */
   const restoreSearchIntents = (root: HTMLElement): void => {
-    for (const [slot, intent] of searchIntents) {
-      const savedValue = pickerQueries.get(slot) ?? ''
-      const savedCaret = intent.caret
-      if (savedValue === '' && savedCaret === 0) continue
-      const input = root.querySelector(`input[data-lt-search="${slot}"]`)
-      if (!(input instanceof HTMLInputElement)) continue
-      input.focus()
-      try {
-        const caret = Math.min(savedCaret, input.value.length)
-        input.setSelectionRange(caret, caret)
-      } catch {
-        // Some engines reject selection APIs on `type="search"`; focus alone
-        // keeps typing working.
-      }
+    if (!prevSlot) return
+    const input = root.querySelector(`input[data-lt-search="${prevSlot}"]`)
+    if (!(input instanceof HTMLInputElement)) return
+    if (prevSlotCaret === 0 && input.value === '') return
+    input.focus()
+    try {
+      const caret = Math.min(prevSlotCaret, input.value.length)
+      input.setSelectionRange(caret, caret)
+    } catch {
+      // Some engines reject selection APIs on `type="search"`; focus alone
+      // keeps typing working.
     }
   }
 
@@ -1069,18 +1045,12 @@ export function renderCharactersSection(options: {
     const view = store.view
 
     const active = document.activeElement as HTMLInputElement | null
-    for (const [slot, intent] of searchIntents) {
-      const input = document.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
-      if (input && active === input) {
-        intent.focused = true
-        intent.caret = input.selectionStart ?? input.value.length
-      }
-    }
-
-    const savedInputs = new Map<string, HTMLInputElement>()
-    for (const [slot] of searchIntents) {
-      const input = document.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
-      if (input) savedInputs.set(slot, input)
+    if (active && active.dataset.ltSearch) {
+      prevSlot = active.dataset.ltSearch as string
+      prevSlotCaret = active.selectionStart ?? active.value.length
+    } else {
+      prevSlot = null
+      prevSlotCaret = 0
     }
 
     teardown()
@@ -1133,39 +1103,6 @@ export function renderCharactersSection(options: {
 
     container.appendChild(root)
 
-    for (const [slot, input] of savedInputs) {
-      const rebuilt = root.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
-      if (rebuilt && rebuilt.parentElement) {
-        rebuilt.parentElement.replaceChild(input, rebuilt)
-        if (slot === 'characters') input.value = view.characterQuery
-        else input.value = pickerQueries.get(slot) ?? ''
-        track(on(input, 'input', () => {
-          if (searchTimer) clearTimeout(searchTimer)
-          if (slot === 'characters') {
-            searchTimer = setTimeout(() => store.actions.setCharacterQuery(input.value), 1000)
-          } else {
-            pickerTimer = setTimeout(() => {
-              pickerQueries.set(slot, input.value)
-              pickerOpenState.set(slot, true)
-              render()
-            }, 1000)
-          }
-        }))
-      }
-    }
-  for (const [slot] of savedInputs) {
-    const intent = searchIntents.get(slot)
-    if (intent && intent.focused) {
-      const input = savedInputs.get(slot)!
-      input.focus()
-      try {
-        const caret = Math.min(intent.caret, input.value.length)
-        input.setSelectionRange(caret, caret)
-      } catch { /* ignore */ }
-    }
-  }
-
-
     restoreSearchIntents(root)
   }
 
@@ -1179,7 +1116,8 @@ export function renderCharactersSection(options: {
       // Focus intent is dropped so a torn-down panel never steals focus back;
       // the pickers' typed text is deliberately KEPT, because `destroy()` runs
       // on every shell rebuild and clearing it would wipe what the user typed.
-      for (const intent of searchIntents.values()) intent.focused = false
+      prevSlot = null
+      prevSlotCaret = 0
       clear(container)
     },
   }
