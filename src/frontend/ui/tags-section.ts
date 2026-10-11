@@ -183,8 +183,8 @@ export function renderTagsSection(options: {
     const input = el('input', {
       class: 'lt-search',
       type: 'search',
-      'aria-label': 'Search tags. Prefix with C: to search character names instead.',
-      placeholder: 'Search tags (C:name searches characters)',
+      'aria-label': 'Search tags with T:, character fields with A:, or character names with C:.',
+      placeholder: 'Search tags (T:tag, A:fields, C:character)',
       autocomplete: 'off',
       autocapitalize: 'none',
       spellcheck: 'false',
@@ -329,8 +329,8 @@ export function renderTagsSection(options: {
     panel.appendChild(el('p', { class: 'lt-state__title' }, ['Character search mode (C:)']))
     panel.appendChild(
       el('p', { class: 'lt-state__detail' }, [
-        'C: searches CHARACTER NAMES, not tag names. The characters below matched by name, with ' +
-          'the tags they currently carry. Remove the C: prefix to search tag names again.',
+        'A: searches character fields and C: searches character names. The characters below matched ' +
+          'your character query, with the tags they currently carry. Use T: to search exact tag names.',
       ]),
     )
 
@@ -339,8 +339,8 @@ export function renderTagsSection(options: {
       panel.appendChild(
         emptyState(
           'No characters matched',
-          'No character name matches this C: search. Tag names are not searched in C: mode, so ' +
-            'drop the C: prefix to search tags by name.',
+          'No characters match this query. A: searches character fields; C: searches character names. ' +
+            'Use T: to search exact tag names.',
         ),
       )
       return panel
@@ -781,7 +781,7 @@ export function renderTagsSection(options: {
     const toolbar = renderToolbar(view)
     const searchInput = buildSearch(view.tagQuery, (v) => {
       if (searchTimer) clearTimeout(searchTimer)
-      searchTimer = setTimeout(() => store.actions.setTagQuery(v), 1000)
+      searchTimer = setTimeout(() => store.actions.setTagQuery(v), 1500)
     })
     const searchBar = el('div', { class: 'lt-toolbar__search' })
     searchBar.appendChild(field('Search', searchInput))
