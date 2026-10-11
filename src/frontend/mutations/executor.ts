@@ -21,6 +21,14 @@
  *     may let the retained set grow past it. A report is evicted ONLY once the
  *     failure panel has had no way to reference it for a whole panel-window, so
  *     retention is a memory bound and never a visibility change.
+ *
+ *  4. **Progress emission is bounded, not per-character.** A `snapshot()`
+ *     deep-clones every result, so emitting one per character made `execute()`
+ *     allocate O(M^2) `MutationResult`s for M characters — hundreds of
+ *     megabytes of transient garbage on a bulk merge, which OOM-killed the
+ *     Termux WebView *after* the write had already landed. Emissions are
+ *     therefore coalesced on a clock (and skipped entirely when no hook is
+ *     supplied), so the cost is O(M) whatever M is.
  */
 
 import type { CharacterMutationPort } from '../repository'
@@ -59,6 +67,17 @@ export const DEFAULT_WRITE_CONCURRENCY = 4
  * letting every bulk edit's `results` array accumulate for the extension's life.
  */
 export const RETAINED_REPORT_LIMIT = 32
+
+/**
+ * Minimum wall-clock gap between two consecutive `onProgress` emissions.
+ *
+ * Every emission deep-clones the whole result list, so the emission count is
+ * the single multiplier on `execute()`'s allocation cost. At 50ms a listener
+ * sees ~20 updates per second — enough to animate a progress bar, and few
+ * enough that the count tracks how long a merge takes rather than how many
+ * characters it touches.
+ */
+export const PROGRESS_EMIT_INTERVAL_MS = 50
 
 export interface ExecutorOptions {
   /**
@@ -322,6 +341,10 @@ export class MutationExecutor {
    * a character whose planned changes disagree is announced through
    * `onProgress` only, as it was before batching, because nothing was attempted
    * for it.
+   *
+   * `onProgress` is COALESCED (see {@link PROGRESS_EMIT_INTERVAL_MS}) while
+   * `onResult` stays per-mutation: one clone each either way, but a progress
+   * snapshot clones ALL results, so it cannot be per-character.
    */
   async execute(preview: OperationPreview, hooks?: ExecuteHooks): Promise<OperationReport> {
     const startedAt = this.now()
@@ -348,19 +371,38 @@ export class MutationExecutor {
       else byCharacter.set(m.characterId, [m])
     }
 
+    let lastProgressAt = startedAt
+    let progressEmitted = false
     /**
-     * Emit one progress snapshot.
+     * Emit one progress snapshot, rate-limited to {@link PROGRESS_EMIT_INTERVAL_MS}.
      *
-     * `snapshot()` already derives the totals and status from the results, and
-     * it is the ONLY derivation here: this runs once per character, so deriving
-     * before taking the snapshot as well walked the same results three more
-     * times for numbers the snapshot was about to recompute anyway.
+     * `snapshot()` deep-clones every result, so emitting it once per character
+     * made a merge of M characters allocate O(M^2) `MutationResult`s — hundreds
+     * of megabytes of transient garbage, which OOM-killed the Termux WebView
+     * AFTER the write had already succeeded. Coalescing on the injected clock
+     * ties the emission count to the operation's DURATION instead of its width;
+     * a progress bar needs tens of updates a second, not one per character.
+     *
+     * The first emission is unconditional so a listener is told the run has
+     * STARTED before any rate limit can swallow it, and `execute()` always
+     * emits the terminal report itself, so no listener misses an end state.
+     *
+     * With no `onProgress` hook nothing is listening and nothing is derived:
+     * `live.totals`/`live.status` are re-derived by the final snapshot below
+     * and by every reader (`getReport()` re-snapshots; `runRetry` derives its
+     * own working copy), so no in-flight value is observable mid-write.
      */
     const progress = (): void => {
+      const onProgress = hooks?.onProgress
+      if (onProgress === undefined) return
+      const at = this.now()
+      if (progressEmitted && at - lastProgressAt < PROGRESS_EMIT_INTERVAL_MS) return
+      lastProgressAt = at
+      progressEmitted = true
       const emitted = snapshot(live, true)
       live.totals = emitted.totals
       live.status = emitted.status
-      hooks?.onProgress?.(emitted)
+      onProgress(emitted)
     }
 
     // Characters are resolved into ONE write batch. A conflicting character is

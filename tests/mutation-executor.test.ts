@@ -1224,7 +1224,7 @@ describe('batch failures', () => {
     expect(port.tagsOf('c1')).toEqual(['Elf'])
   })
 
-  test('hooks still fire once per mutation, and progress once per character', async () => {
+  test('hooks still fire once per mutation, and progress ends on the final report', async () => {
     const port = new MockPort()
     port.seed('ok1', 'A', [])
     port.seed('bad', 'B', [])
@@ -1233,7 +1233,9 @@ describe('batch failures', () => {
 
     const onResult: string[] = []
     const progressCounts: number[] = []
-    await new MutationExecutor(port).execute(
+    // A frozen clock makes the coalescing deterministic: a run that completes
+    // with no time passing is the "already fast" end of the rate limit.
+    await new MutationExecutor(port, { now: () => 1234 }).execute(
       previewOf([
         planMutation({ characterId: 'ok1', addedTags: ['Elf'] }),
         planMutation({ characterId: 'bad', addedTags: ['Elf'] }),
@@ -1246,9 +1248,15 @@ describe('batch failures', () => {
     )
 
     expect(onResult.sort()).toEqual(['bad:failed', 'ok1:succeeded', 'ok2:succeeded'])
-    // One per character while it settles, then the final report — never fewer.
+    // CHANGED CONTRACT (was: "one per character", asserted as exactly 4).
+    // `onProgress` is now COALESCED on the clock rather than per-character: each
+    // emission deep-clones every result, so one-per-character made a merge of M
+    // characters allocate O(M^2) and OOM the WebView after the write landed.
+    // What the listener still depends on is unchanged and still asserted —
+    // the last emission reports EVERY character settled, not one fewer.
     expect(progressCounts[progressCounts.length - 1]).toBe(3)
-    expect(progressCounts.length).toBe(4)
+    // The primed first emission, plus the terminal one.
+    expect(progressCounts.length).toBe(2)
   })
 
   test('the returned report is a separate object from the executor state', async () => {
