@@ -233,9 +233,12 @@ function uiSafeMessage(error: unknown, fallback: string): string {
   return message.trim() === '' ? fallback : message
 }
 
-function hasAnyQueryTerm(raw: string): boolean {
-  const match = /(?:^|[\s,])-?c:/i.exec(raw)
-  return match !== null
+function hasCharacterQueryTerm(query: ParsedQuery): boolean {
+  // A: searches character fields and C: searches character names. In the Tags
+  // panel either prefix switches the results from tags to matching characters.
+  return query.groups.some((group) =>
+    group.terms.some((term) => term.field === 'char' || term.field === 'any'),
+  )
 }
 
 /** Raw, mutable store state. Nothing here is handed to the UI directly. */
@@ -595,7 +598,7 @@ export class TagManagerStore {
   } {
     const s = this.state
     const parsed = parseQuery(s.tagQuery)
-    const isCharacterMode = hasAnyQueryTerm(s.tagQuery)
+    const isCharacterMode = hasCharacterQueryTerm(parsed.query)
 
     // In `C:` mode the query describes CHARACTERS, not tags. Falling back to a
     // tag-name search here would silently answer a different question, so the
@@ -610,7 +613,7 @@ export class TagManagerStore {
       ? []
       : parsed.errors.length > 0
         ? filterByBestEffortTerms(s.tagIndex.tags, parsed.query)
-        : filterTagsByName(s.tagIndex.tags, s.tagQuery)
+        : filterTagsByQuery(s.tagIndex.tags, parsed.query, s.tagQuery)
     const sorted = sortTags(nameFiltered, s.tagSort)
     const rows = sorted.map((entry) => ({
       entry,
@@ -1064,6 +1067,35 @@ export class TagManagerStore {
  * is a plain positive substring match. With no usable name term at all, the
  * catalog is returned unfiltered: showing everything beats showing nothing.
  */
+/**
+ * Search the tag catalog using the shared query syntax. Bare terms are
+ * case-insensitive name substrings; T: terms match a whole tag name. A:/C:
+ * terms are handled by character mode before this helper is called.
+ */
+function filterTagsByQuery(
+  tags: readonly TagEntry[],
+  query: ParsedQuery,
+  rawQuery: string,
+): TagEntry[] {
+  if (query.empty || query.groups.length === 0) return filterTagsByName(tags, rawQuery)
+  const usable = query.groups.some((group) =>
+    group.terms.some((term) => term.field === 'name' || term.field === 'tag'),
+  )
+  if (!usable) return [...tags]
+
+  return tags.filter((entry) => {
+    const name = (entry.name ?? '').toLowerCase()
+    return query.groups.some((group) =>
+      group.terms.every((term) => {
+        if (term.field !== 'name' && term.field !== 'tag') return true
+        const value = term.value.toLowerCase()
+        const positive = value !== '' && (term.field === 'tag' ? name === value : name.includes(value))
+        return term.negated ? !positive : positive
+      }),
+    )
+  })
+}
+
 function filterByBestEffortTerms(tags: readonly TagEntry[], query: ParsedQuery): TagEntry[] {
   const nameTerms: string[] = []
   for (const group of query.groups) {
