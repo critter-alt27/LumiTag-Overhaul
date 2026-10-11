@@ -736,9 +736,27 @@ export function renderTagsSection(options: {
     if (!savedSearchHost) {
       savedSearchHost = el('div', { class: 'lt-search-host' })
     }
-    // Build/rebuild the persistent search input outside the rebuilt zone
+    // Preserve existing input value and caret before clearing (variables already declared above).
+    const existingInput = savedSearchHost.querySelector('input.lt-search') as HTMLInputElement | null
+
+    // Build/rebuild the persistent search input outside the rebuilt zone,
+    // WITHOUT track() so teardown() does not kill its listener.
     savedSearchHost.innerHTML = ''
-    const search = buildSearch(view.tagQuery, (value) => store.actions.setTagQuery(value))
+    const search = el('input', {
+      class: 'lt-search',
+      type: 'search',
+      'aria-label': 'Search tags. Prefix with C: to search character names instead.',
+      placeholder: 'Search tags (C:name searches characters)',
+      autocomplete: 'off',
+      autocapitalize: 'none',
+      spellcheck: 'false',
+    }) as HTMLInputElement
+    search.value = view.tagQuery
+    // Direct listener, not tracked — survives teardown()
+    search.addEventListener('input', () => store.actions.setTagQuery(search.value))
+    search.addEventListener('focus', () => { searchFocusIntent = true })
+    search.addEventListener('blur', () => { searchFocusIntent = false })
+    search.addEventListener('keyup', () => { searchCaret = search.selectionStart ?? search.value.length })
     savedSearchHost.appendChild(field('Search', search))
 
     teardown()
