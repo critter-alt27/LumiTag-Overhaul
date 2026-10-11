@@ -16,13 +16,7 @@
  *     made between attempts survives, and a write that actually landed before
  *     a timeout is detected instead of being applied twice.
  *
- *  3. **Retained reports are a bounded window, never the whole session.**
- *     {@link RETAINED_REPORT_LIMIT} is the executor's LRU ceiling; nothing else
- *     may let the retained set grow past it. A report is evicted ONLY once the
- *     failure panel has had no way to reference it for a whole panel-window, so
- *     retention is a memory bound and never a visibility change.
- *
- *  4. **Progress emission is bounded, not per-character.** A `snapshot()`
+ *  3. **Progress emission is bounded, not per-character.** A `snapshot()`
  *     deep-clones every result, so emitting one per character made `execute()`
  *     allocate O(M^2) `MutationResult`s for M characters — hundreds of
  *     megabytes of transient garbage on a bulk merge, which OOM-killed the
@@ -48,25 +42,6 @@ import {
 
 /** Default number of simultaneous character writes during a retry. */
 export const DEFAULT_WRITE_CONCURRENCY = 4
-
-/**
- * How many finished operation reports stay resident in this executor.
- *
- * The failure panel is what the only two readers — `getReport()` and
- * `runRetry()` — exist to serve, and the store already caps what the panel can
- * show at `REPORT_LIMIT = 20` (`store.ts`), trimming from the OLDEST end.
- * Anything the panel can still reference is therefore among the last 20
- * completed operations.
- *
- * 32 rather than 20: `execute()` records each operation TWICE (a live entry at
- * start, a snapshot at the end), so executor recency and store recency drift by
- * one, and `runRetry` re-inserts an OLD opId — moving it to the front of the
- * LRU while the store keeps it in place. A margin of one full panel-window over
- * the store's own 20 makes eviction unreachable for anything the panel holds,
- * while still capping the session's report memory at a small constant instead of
- * letting every bulk edit's `results` array accumulate for the extension's life.
- */
-export const RETAINED_REPORT_LIMIT = 32
 
 /**
  * Minimum wall-clock gap between two consecutive `onProgress` emissions.
@@ -314,7 +289,6 @@ export class MutationExecutor {
   private readonly port: CharacterMutationPort
   private readonly concurrency: number
   private readonly now: () => number
-  private readonly reports = new Map<string, OperationReport>()
   /**
    * In-flight retries, keyed by mutationId. The value is the shared promise
    * for that attempt: a duplicate retry AWAITS it and adopts its outcome
@@ -359,7 +333,6 @@ export class MutationExecutor {
       results,
       totals: computeTotals(results),
     }
-    this.store(preview.opId, live)
     // `results` is only ever mutated in place from here on, so the index built
     // once here stays correct for the whole operation.
     const index = indexResults(results)
@@ -389,7 +362,7 @@ export class MutationExecutor {
      *
      * With no `onProgress` hook nothing is listening and nothing is derived:
      * `live.totals`/`live.status` are re-derived by the final snapshot below
-     * and by every reader (`getReport()` re-snapshots; `runRetry` derives its
+     * and by `runRetry`, which derives its
      * own working copy), so no in-flight value is observable mid-write.
      */
     const progress = (): void => {
@@ -520,9 +493,6 @@ export class MutationExecutor {
     const report = snapshot(live, false)
     live.status = report.status
     live.totals = report.totals
-    // Store a SEPARATE snapshot so a caller mutating what it got back can
-    // never corrupt the executor's own state.
-    this.store(preview.opId, snapshot(live, false))
     hooks?.onProgress?.(report)
     return report
   }
@@ -545,55 +515,6 @@ export class MutationExecutor {
       .filter((r) => r.state === 'failed' || r.state === 'conflict')
       .map((r) => r.mutationId)
     return this.runRetry(report, ids)
-  }
-
-  getReport(opId: string): OperationReport | undefined {
-    const stored = this.touch(opId)
-    return stored === undefined ? undefined : snapshot(stored, stored.finishedAt === undefined)
-  }
-
-  /**
-   * Record a report and drop whatever fell out of the retention window.
-   *
-   * Re-storing an opId both REPLACES its entry and refreshes its recency, which
-   * is what makes a report the user just retried the least likely to be the one
-   * evicted next.
-   */
-  private store(opId: string, report: OperationReport): void {
-    // Delete first: a Map's iteration order is insertion order, so re-setting
-    // an existing key would otherwise leave the stale position in place.
-    this.reports.delete(opId)
-    this.reports.set(opId, report)
-    this.prune()
-  }
-
-  /** Read a report and mark it most-recently-used. */
-  private touch(opId: string): OperationReport | undefined {
-    const stored = this.reports.get(opId)
-    if (stored === undefined) return undefined
-    this.reports.delete(opId)
-    this.reports.set(opId, stored)
-    return stored
-  }
-
-  /**
-   * Evict least-recently-stored reports until the window is back within
-   * {@link RETAINED_REPORT_LIMIT}.
-   *
-   * A report with no `finishedAt` is STILL RUNNING and is never a candidate:
-   * `execute()` stores the live object up front so a progress read or a retry
-   * racing the write still finds it, and dropping it mid-flight would leave
-   * `runRetry` to silently retry a stale snapshot — the exact failure invariant
-   * 2 exists to prevent. The window is sized far above the number of operations
-   * a user can have in flight at once, so skipping live entries can never make
-   * the bound unreachable in practice.
-   */
-  private prune(): void {
-    for (const [opId, report] of this.reports) {
-      if (this.reports.size <= RETAINED_REPORT_LIMIT) return
-      if (report.finishedAt === undefined) continue
-      this.reports.delete(opId)
-    }
   }
 
   /** True when this exact mutation currently has a retry in flight. */
@@ -676,7 +597,6 @@ export class MutationExecutor {
     const final = snapshot(working, false)
     working.status = final.status
     working.totals = final.totals
-    this.store(working.opId, snapshot(working, false))
     return final
   }
 

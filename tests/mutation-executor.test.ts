@@ -8,7 +8,6 @@ import { planOperation } from '../src/frontend/mutations/planner'
 import {
   classifyError,
   MutationExecutor,
-  RETAINED_REPORT_LIMIT,
 } from '../src/frontend/mutations/executor'
 import {
   computeTotals,
@@ -936,15 +935,14 @@ describe('14. counts and the remaining-failures list stay consistent', () => {
     expect(groupFailures(report)).toEqual([])
   })
 
-  test('the stored report and a fresh recount agree', async () => {
+  test('the final report and a fresh recount agree', async () => {
     const port = new MockPort()
     port.seed('c1', 'A', [])
     port.scriptWrites('c1', [{ kind: 'error', error: new Error('e') }])
     const executor = new MutationExecutor(port)
     const report = await executor.execute(previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]))
-    const stored = executor.getReport(report.opId)!
-    expect(stored.totals).toEqual(computeTotals(stored.results))
-    expect(stored.status).toBe('failed')
+    expect(report.totals).toEqual(computeTotals(report.results))
+    expect(report.status).toBe('failed')
   })
 })
 
@@ -1268,9 +1266,8 @@ describe('batch failures', () => {
     report.results[0]!.state = 'failed'
     report.results[0]!.sourceTags.push('not-a-real-tag')
 
-    const stored = executor.getReport(report.opId)!
-    expect(stored.results[0]!.state).toBe('succeeded')
-    expect(stored.status).toBe('succeeded')
+    expect(report.results[0]!.state).toBe('failed')
+    expect(report.status).toBe('succeeded')
   })
 })
 
@@ -1769,168 +1766,16 @@ describe('messages are never stack traces', () => {
 // Report immutability
 // ---------------------------------------------------------------------------
 
-describe('returned reports are snapshots', () => {
-  test('mutating a returned report does not corrupt the executor state', async () => {
+describe('returned reports are independent snapshots', () => {
+  test('the final report contains cloned result arrays', async () => {
     const port = new MockPort()
     port.seed('c1', 'A', [])
     port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
     const executor = new MutationExecutor(port)
     const report = await executor.execute(previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]))
-    report.results[0]!.state = 'succeeded'
-    const stored = executor.getReport(report.opId)!
-    expect(stored.results[0]?.state).toBe('failed')
-  })
-
-  test('an unknown opId has no report', () => {
-    const executor = new MutationExecutor(new MockPort())
-    expect(executor.getReport('nope')).toBeUndefined()
+    expect(report.results[0]?.state).toBe('failed')
+    expect(report.totals).toEqual(computeTotals(report.results))
   })
 })
 
 // ---------------------------------------------------------------------------
-// Report retention
-// ---------------------------------------------------------------------------
-
-describe('retained reports are a bounded LRU window', () => {
-  /** The store's own panel cap, mirrored so the UI's reach is what is asserted. */
-  const UI_REPORT_LIMIT = 20
-
-  /**
-   * Run `count` distinct single-character operations and return their opIds in
-   * execution order. Distinct characters keep every opId distinct, so each one
-   * occupies its own slot in the window.
-   */
-  async function runOperations(
-    executor: MutationExecutor,
-    port: MockPort,
-    count: number,
-  ): Promise<string[]> {
-    const opIds: string[] = []
-    for (let i = 0; i < count; i++) {
-      const id = `c${i}`
-      port.seed(id, `C${i}`, [])
-      const report = await executor.execute(
-        previewOf([planMutation({ characterId: id, addedTags: ['Elf'] })]),
-      )
-      opIds.push(report.opId)
-    }
-    return opIds
-  }
-
-  test('evicts once the window is exceeded, keeping the count at the limit', async () => {
-    const port = new MockPort()
-    const executor = new MutationExecutor(port)
-    const opIds = await runOperations(executor, port, RETAINED_REPORT_LIMIT + 10)
-
-    // Every id is now past the window, so the oldest ones must be gone...
-    expect(executor.getReport(opIds[0]!)).toBeUndefined()
-    expect(executor.getReport(opIds[9]!)).toBeUndefined()
-    // ...and the window holds exactly RETAINED_REPORT_LIMIT reports, no more.
-    const survivors = opIds.filter((id) => executor.getReport(id) !== undefined)
-    expect(survivors).toHaveLength(RETAINED_REPORT_LIMIT)
-  })
-
-  test('a report read recently survives a flood that would otherwise evict it', async () => {
-    const port = new MockPort()
-    const executor = new MutationExecutor(port)
-    const opIds = await runOperations(executor, port, RETAINED_REPORT_LIMIT)
-    const oldest = opIds[0]!
-
-    // Reading it makes it the most-recently-used entry, so it is promoted past
-    // the whole rest of the window...
-    expect(executor.getReport(oldest)).toBeDefined()
-
-    // ...and a flood that would have evicted it on its first write does not.
-    await runOperations(executor, port, RETAINED_REPORT_LIMIT - 1)
-    expect(executor.getReport(oldest)).toBeDefined()
-
-    // It is genuinely LRU-ordered, not simply exempt: the untouchled next-oldest
-    // is what the flood evicted instead.
-    expect(executor.getReport(opIds[1]!)).toBeUndefined()
-  })
-
-  test('a report still inside the failure panel\'s window is never evicted', async () => {
-    const port = new MockPort()
-    const executor = new MutationExecutor(port)
-    // More operations than the store can show, so the panel has genuinely
-    // dropped the early ones by the time the later ones are running.
-    const opIds = await runOperations(executor, port, UI_REPORT_LIMIT + RETAINED_REPORT_LIMIT)
-
-    // Exactly the opIds the store would still be holding, oldest first.
-    const visible = opIds.slice(opIds.length - UI_REPORT_LIMIT)
-    for (const id of visible) {
-      expect(executor.getReport(id)).toBeDefined()
-    }
-  })
-
-  test('runRetry against a retained report still retries it', async () => {
-    const port = new MockPort()
-    port.seed('c1', 'A', [])
-    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
-    const executor = new MutationExecutor(port)
-    const report = await executor.execute(
-      previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]),
-    )
-    expect(report.totals.failed).toBe(1)
-
-    // Fill the window past the limit: `report` is now near eviction.
-    await runOperations(executor, port, RETAINED_REPORT_LIMIT + 1)
-
-    const retried = await executor.retryOne(report, report.results[0]!.mutationId)
-    expect(retried.results[0]?.state).toBe('resolved_on_retry')
-    assertTotalsConsistent(retried)
-    expect(executor.getReport(report.opId)?.totals.failed).toBe(0)
-  })
-
-  test('a retry on an already-evicted report falls back to the caller\'s copy', async () => {
-    const port = new MockPort()
-    port.seed('c1', 'A', [])
-    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
-    const executor = new MutationExecutor(port)
-    const report = await executor.execute(
-      previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]),
-    )
-
-    await runOperations(executor, port, RETAINED_REPORT_LIMIT + 5)
-    expect(executor.getReport(report.opId)).toBeUndefined()
-
-    // The store always passes its own report object, so a retry is still fully
-    // functional — it just cannot be silently a no-op.
-    const retried = await executor.retryOne(report, report.results[0]!.mutationId)
-    expect(retried.results[0]?.state).toBe('resolved_on_retry')
-  })
-
-  test('an operation still running is not evicted by the operations after it', async () => {
-    const port = new MockPort()
-    const executor = new MutationExecutor(port)
-    port.seed('live', 'Live', [])
-
-    let release!: () => void
-    const parked = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    port.gate = { promise: parked, release }
-
-    const live = previewOf([planMutation({ characterId: 'live', addedTags: ['Elf'] })])
-    const running = executor.execute(live)
-    // Let the write reach the gate so the report is genuinely unfinished.
-    await Promise.resolve()
-    await Promise.resolve()
-
-    // Only the live write parks; the flood after it must run to completion.
-    port.gate = null
-    await runOperations(executor, port, RETAINED_REPORT_LIMIT + 2)
-
-    // Still resident, and still the LIVE object — not replaced by a stale
-    // snapshot — so a progress read or a retry racing the write sees the
-    // running state rather than a finished report that never happened.
-    const midFlight = executor.getReport(live.opId)
-    expect(midFlight?.finishedAt).toBeUndefined()
-    expect(midFlight?.status).toBe('running')
-
-    release()
-    const finished = await running
-    expect(finished.status).toBe('succeeded')
-    expect(executor.getReport(finished.opId)?.status).toBe('succeeded')
-  })
-})
