@@ -125,3 +125,66 @@ export function buildTagIndex(characters: readonly LumiTagCharacter[]): TagIndex
     characterCount: byCharacterId.size,
   }
 }
+
+
+/**
+ * Incrementally apply tag-only character refreshes to an existing index.
+ *
+ * Only tag keys present before or after the changed characters are rescanned.
+ * This preserves buildTagIndex's ordering/spelling semantics while avoiding
+ * rebuilding every tag entry and membership list for every mutation.
+ *
+ * Unknown character ids are ignored, matching the store's tags-only merge
+ * behavior. Duplicate ids are already collapsed in `index.byCharacterId`.
+ */
+export function updateTagIndex(
+  index: TagIndex,
+  updated: ReadonlyMap<string, { tags: readonly string[] }>,
+): TagIndex {
+  if (updated.size === 0) return index
+
+  const byCharacterId = new Map(index.byCharacterId)
+  const affectedKeys = new Set<string>()
+
+  for (const [rawId, value] of updated) {
+    const id = typeof rawId === 'string' ? rawId.trim() : ''
+    if (id === '' || !byCharacterId.has(id)) continue
+
+    const previous = byCharacterId.get(id) ?? []
+    const next = dedupeTagNames(Array.isArray(value?.tags) ? value.tags : [])
+    for (const name of previous) affectedKeys.add(tagKey(name))
+    for (const name of next) affectedKeys.add(tagKey(name))
+    byCharacterId.set(id, next)
+  }
+
+  if (affectedKeys.size === 0) return index
+
+  const byKey = new Map(index.byKey)
+  for (const key of affectedKeys) {
+    let name = ''
+    const characterIds: string[] = []
+    for (const [characterId, names] of byCharacterId) {
+      const matchingName = names.find((candidate) => tagKey(candidate) === key)
+      if (matchingName === undefined) continue
+      if (name === '') name = matchingName
+      characterIds.push(characterId)
+    }
+
+    if (characterIds.length === 0) {
+      byKey.delete(key)
+    } else {
+      byKey.set(key, { name, key, count: characterIds.length, characterIds })
+    }
+  }
+
+  const tags = [...byKey.values()].sort((a, b) =>
+    a.key < b.key ? -1 : a.key > b.key ? 1 : 0,
+  )
+
+  return {
+    tags,
+    byKey,
+    byCharacterId,
+    characterCount: byCharacterId.size,
+  }
+}

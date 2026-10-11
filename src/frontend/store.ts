@@ -30,7 +30,7 @@ import type { ParsedQuery, QuerySyntaxError } from './search/parser'
 import { parseQuery } from './search/parser'
 import type { SearchHelpSection } from './search/search-help'
 import { getSearchHelpSections } from './search/search-help'
-import { buildTagIndex, tagKey, type TagEntry, type TagIndex } from './tag-index'
+import { buildTagIndex, tagKey, updateTagIndex, type TagEntry, type TagIndex } from './tag-index'
 import { filterTagsByName, sortTags, type TagSortMode } from './tag-sorting'
 import { classifyError } from './mutations/executor'
 import type { MutationExecutor } from './mutations/executor'
@@ -449,7 +449,7 @@ export class TagManagerStore {
     }
 
     this.state.characters = next
-    this.state.tagIndex = buildTagIndex(next)
+    this.state.tagIndex = updateTagIndex(this.state.tagIndex, updated)
     this.pruneSelections()
   }
 

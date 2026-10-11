@@ -8,6 +8,7 @@ import {
   normalizeTagName,
   tagKey,
   tagsForCharacter,
+  updateTagIndex,
   type TagIndex,
 } from '../src/frontend/tag-index'
 import type { LumiTagCharacter } from '../src/shared/types'
@@ -227,5 +228,50 @@ describe('lookups', () => {
     const first = tagsForCharacter(index, 'c2')
     first.push('mutated')
     expect(tagsForCharacter(index, 'c2')).toEqual(['Elf', 'Warrior'])
+  })
+})
+
+
+describe('updateTagIndex', () => {
+  test('matches a full rebuild after changing tags on existing characters', () => {
+    const beforeCharacters = [
+      character('c1', 'Ayla', ['Elf', 'Magic']),
+      character('c2', 'Bran', ['Elf', 'Warrior']),
+      character('c3', 'Cira', ['Magic', 'Rogue']),
+    ]
+    const before = buildTagIndex(beforeCharacters)
+    const updated = new Map([
+      ['c1', { tags: ['elf', 'Rogue', 'New Tag', 'new tag'] }],
+      ['c3', { tags: ['Magic'] }],
+    ])
+    const incremental = updateTagIndex(before, updated)
+    const expected = buildTagIndex(beforeCharacters.map((c) => {
+      const replacement = updated.get(c.id)
+      return replacement ? { ...c, tags: [...replacement.tags] } : c
+    }))
+
+    expect(incremental.tags).toEqual(expected.tags)
+    expect([...incremental.byCharacterId]).toEqual([...expected.byCharacterId])
+    expect(incremental.characterCount).toBe(expected.characterCount)
+    expect(incremental.byKey).toEqual(expected.byKey)
+  })
+
+  test('preserves first spelling and removes tags with no remaining assignments', () => {
+    const before = buildTagIndex([
+      character('c1', 'Ayla', ['ELF', 'Gone']),
+      character('c2', 'Bran', ['elf']),
+    ])
+    const incremental = updateTagIndex(before, new Map([
+      ['c1', { tags: ['Gone'] }],
+    ]))
+    expect(incremental.byKey.get('elf')?.name).toBe('elf')
+    expect(incremental.byKey.get('elf')?.characterIds).toEqual(['c2'])
+    expect(incremental.byKey.has('gone')).toBe(true)
+  })
+
+  test('ignores unknown ids and returns the same index for no effective changes', () => {
+    const before = buildTagIndex(FIXTURE)
+    expect(updateTagIndex(before, new Map())).toBe(before)
+    expect(updateTagIndex(before, new Map([['missing', { tags: ['New'] }]]))).toBe(before)
   })
 })
