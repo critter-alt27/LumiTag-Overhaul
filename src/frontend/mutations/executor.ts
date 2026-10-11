@@ -520,9 +520,12 @@ export class MutationExecutor {
     const report = snapshot(live, false)
     live.status = report.status
     live.totals = report.totals
-    // Store a SEPARATE snapshot so a caller mutating what it got back can
-    // never corrupt the executor's own state.
-    this.store(preview.opId, snapshot(live, false))
+    // Diagnostic variant: `report` above is already a detached snapshot of
+    // `live` (including cloned result objects and tag arrays). Retain `live`
+    // directly to avoid allocating a SECOND full result snapshot at the end
+    // of large operations. The returned report remains detached from the
+    // executor's retained state; getReport() still returns its own snapshot.
+    this.store(preview.opId, live)
     hooks?.onProgress?.(report)
     return report
   }

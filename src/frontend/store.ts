@@ -441,11 +441,7 @@ export class TagManagerStore {
     }
 
     this.state.characters = next
-    // Diagnostic variant (priority 2): intentionally skip the expensive full
-    // tag-index rebuild after a successful write. This isolates whether index
-    // construction is the post-write crash point. The tag catalog will be stale
-    // until the extension is reloaded/refreshed; do not use this as a permanent
-    // build. Restore `buildTagIndex(next)` after the one-run diagnostic.
+    this.state.tagIndex = buildTagIndex(next)
     this.pruneSelections()
   }
 
