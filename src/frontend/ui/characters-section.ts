@@ -1148,6 +1148,18 @@ export function renderCharactersSection(options: {
         }))
       }
     }
+  for (const [slot] of savedInputs) {
+    const intent = searchIntents.get(slot)
+    if (intent && intent.focused) {
+      const input = savedInputs.get(slot)!
+      input.focus()
+      try {
+        const caret = Math.min(intent.caret, input.value.length)
+        input.setSelectionRange(caret, caret)
+      } catch { /* ignore */ }
+    }
+  }
+
 
     restoreSearchIntents(root)
   }
