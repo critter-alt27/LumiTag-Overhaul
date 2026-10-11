@@ -224,10 +224,6 @@ export function renderCharactersSection(options: {
 
   let disposers: (() => void)[] = []
   let destroyed = false
-  let prevSlot: string | null = null
-  let prevValue = ''
-  let prevSelectionStart = 0
-  let prevSelectionEnd = 0
 
   const track = (dispose: () => void): void => {
     disposers.push(dispose)
@@ -326,16 +322,18 @@ export function renderCharactersSection(options: {
 
   /** Give every rebuilt search box its focus and caret back. */
   const restoreSearchIntents = (root: HTMLElement): void => {
-    if (!prevSlot) return
-    const input = root.querySelector(`input[data-lt-search="${prevSlot}"]`) as HTMLInputElement | null
-    if (!input) return
-    input.focus()
-    try {
-      const caret = Math.min(prevSelectionStart, input.value.length)
-      const end = Math.min(prevSelectionEnd, input.value.length)
-      input.setSelectionRange(caret, end)
-    } catch {
-      // Some engines reject selection APIs on `type="search"`; focus alone keeps typing working.
+    for (const [slot, intent] of searchIntents) {
+      if (!intent.focused) continue
+      const input = root.querySelector(`input[data-lt-search="${slot}"]`)
+      if (!(input instanceof HTMLInputElement)) continue
+      input.focus()
+      try {
+        const caret = Math.min(intent.caret, input.value.length)
+        input.setSelectionRange(caret, caret)
+      } catch {
+        // Some engines reject selection APIs on `type="search"`; focus alone
+        // keeps typing working.
+      }
     }
   }
 
@@ -1078,11 +1076,11 @@ export function renderCharactersSection(options: {
       }
     }
 
-    const prevInput = (document.activeElement as HTMLInputElement | null) || null
-    prevSlot = prevInput?.getAttribute('data-lt-search') || null
-    prevValue = prevInput ? prevInput.value : ''
-    prevSelectionStart = prevInput ? (prevInput.selectionStart ?? prevValue.length) : 0
-    prevSelectionEnd = prevInput ? (prevInput.selectionEnd ?? prevValue.length) : 0
+    const savedInputs = new Map<string, HTMLInputElement>()
+    for (const [slot] of searchIntents) {
+      const input = document.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
+      if (input) savedInputs.set(slot, input)
+    }
 
     teardown()
     clear(container)
@@ -1117,6 +1115,24 @@ export function renderCharactersSection(options: {
     root.appendChild(renderBulkToolbar(view))
 
     container.appendChild(root)
+
+    for (const [slot, input] of savedInputs) {
+      const rebuilt = root.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
+      if (rebuilt && rebuilt.parentElement) {
+        rebuilt.parentElement.replaceChild(input, rebuilt)
+        if (slot === 'characters') input.value = view.characterQuery
+        else input.value = pickerQueries.get(slot) ?? ''
+        track(on(input, 'input', () => {
+          if (slot === 'characters') store.actions.setCharacterQuery(input.value)
+          else {
+            pickerQueries.set(slot, input.value)
+            pickerOpenState.set(slot, true)
+            render()
+          }
+        }))
+      }
+    }
+
     restoreSearchIntents(root)
   }
 

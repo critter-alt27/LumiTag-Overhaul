@@ -76,12 +76,6 @@ const MODE_BUTTONS: readonly { mode: TagMode; label: string; title: string }[] =
 let searchFocusIntent = false
 let searchCaret = 0
 
-// Directly saved focus state — survives teardown() resetting module variables.
-let prevSearchInput: HTMLInputElement | null = null
-let prevSearchValue = ''
-let prevSearchCaret = 0
-let prevSearchEnd = 0
-
 /** Session-authenticated, read-only avatar endpoint for a character. */
 function avatarUrl(id: string): string {
   return `/api/v1/characters/${encodeURIComponent(id)}/avatar`
@@ -253,17 +247,16 @@ export function renderTagsSection(options: {
 
   /** Give the rebuilt search box its focus and caret back after a re-render. */
   const restoreSearchFocus = (root: HTMLElement): void => {
-    if (!prevSearchInput) return
+    if (!searchFocusIntent) return
     const input = root.querySelector('input.lt-search')
     if (!(input instanceof HTMLInputElement)) return
     input.focus()
     try {
-      const caret = Math.min(prevSearchCaret, input.value.length)
-      const end = Math.min(prevSearchEnd, input.value.length)
-      input.value = prevSearchValue
-      input.setSelectionRange(caret, end)
+      const caret = Math.min(searchCaret, input.value.length)
+      input.setSelectionRange(caret, caret)
     } catch {
-      // Some engines reject selection APIs on `type="search"`; focus alone keeps typing working.
+      // Some engines reject selection APIs on `type="search"`; focus alone
+      // keeps typing working.
     }
   }
 
@@ -735,13 +728,16 @@ export function renderTagsSection(options: {
     const view = store.view
 
     const active = document.activeElement as HTMLInputElement | null
-    const wasFocused = active?.classList.contains('lt-search') ?? false
-    prevSearchInput = wasFocused ? active : null
-    prevSearchValue = prevSearchInput ? prevSearchInput.value : ''
-    prevSearchCaret = prevSearchInput ? (prevSearchInput.selectionStart ?? prevSearchValue.length) : 0
-    prevSearchEnd = prevSearchInput ? (prevSearchInput.selectionEnd ?? prevSearchValue.length) : 0
+    const wasFocused = active?.classList.contains('lt-search')
+    const prevValue = wasFocused ? active.value : ''
+    const prevCaret = wasFocused ? (active.selectionStart ?? 0) : 0
+    const prevEnd = wasFocused ? (active.selectionEnd ?? 0) : 0
     searchFocusIntent = wasFocused
-    searchCaret = prevSearchCaret
+    searchCaret = prevCaret
+
+    let savedSearchInput: HTMLInputElement | null = null
+    const activeInput = container.querySelector('input.lt-search') as HTMLInputElement | null
+    if (wasFocused && activeInput) savedSearchInput = activeInput
 
     teardown()
     clear(container)
@@ -767,6 +763,19 @@ export function renderTagsSection(options: {
     else root.appendChild(renderTagList(view))
 
     container.appendChild(root)
+
+    if (savedSearchInput) {
+      const rebuilt = root.querySelector('input.lt-search') as HTMLInputElement | null
+      if (rebuilt && rebuilt.parentElement) {
+        savedSearchInput.value = view.tagQuery
+        rebuilt.parentElement.replaceChild(savedSearchInput, rebuilt)
+        track(on(savedSearchInput, 'input', () => store.actions.setTagQuery(savedSearchInput!.value)))
+        track(on(savedSearchInput, 'focus', () => { searchFocusIntent = true }))
+        track(on(savedSearchInput, 'blur', () => { searchFocusIntent = false }))
+        track(on(savedSearchInput, 'keyup', () => { searchCaret = savedSearchInput!.selectionStart ?? savedSearchInput!.value.length }))
+      }
+    }
+
     restoreSearchFocus(root)
   }
 
