@@ -1104,6 +1104,23 @@ export function renderCharactersSection(options: {
 
     root.appendChild(renderActiveFilterPicker(view))
 
+    // Bulk tag assignment block at the top, collapsible
+    const bulkHost = el('div', { class: 'lt-bulk-host' })
+    const bulkHeader = el('button', { class: 'lt-bulk-host__toggle', type: 'button', 'aria-expanded': 'true', 'aria-label': 'Toggle bulk tag assignment block' })
+    bulkHeader.appendChild(el('span', { class: 'lt-bulk-host__label' }, ['Bulk Tag Assignment']))
+    bulkHeader.appendChild(el('span', { class: 'lt-bulk-host__indicator' }, ['▾']))
+    const bulkContent = el('div', { class: 'lt-bulk-host__content' })
+    bulkContent.appendChild(renderBulkToolbar(view))
+    bulkHost.appendChild(bulkHeader)
+    bulkHost.appendChild(bulkContent)
+    track(on(bulkHeader, 'click', () => {
+      const open = bulkContent.style.display !== 'none'
+      bulkContent.style.display = open ? 'none' : ''
+      bulkHeader.setAttribute('aria-expanded', open ? 'false' : 'true')
+      bulkHeader.querySelector('.lt-bulk-host__indicator')!.textContent = open ? '▸' : '▾'
+    }))
+    root.appendChild(bulkHost)
+
     if (view.loadState === 'loading') {
       root.appendChild(spinner('Loading characters…'))
       container.appendChild(root)
@@ -1112,7 +1129,6 @@ export function renderCharactersSection(options: {
     }
 
     root.appendChild(renderCharacterList(view))
-    root.appendChild(renderBulkToolbar(view))
 
     container.appendChild(root)
 

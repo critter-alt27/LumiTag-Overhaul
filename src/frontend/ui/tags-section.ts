@@ -199,9 +199,6 @@ export function renderTagsSection(options: {
   const renderToolbar = (view: StoreView): HTMLElement => {
     const bar = el('div', { class: 'lt-toolbar', role: 'toolbar', 'aria-label': 'Tag actions' })
 
-    const search = buildSearch(view.tagQuery, (value) => store.actions.setTagQuery(value))
-    bar.appendChild(el('div', { class: 'lt-toolbar__grow' }, [field('Search', search)]))
-
     const sort = buildSelect(view.tagSort, (value) => store.actions.setTagSort(value))
     bar.appendChild(
       field('Sort by', sort, '“Only 0 Characters” lists tags nothing is assigned to'),
@@ -735,12 +732,18 @@ export function renderTagsSection(options: {
     searchFocusIntent = wasFocused
     searchCaret = prevCaret
 
-    let savedSearchInput: HTMLInputElement | null = null
-    const activeInput = container.querySelector('input.lt-search') as HTMLInputElement | null
-    if (wasFocused && activeInput) savedSearchInput = activeInput
+    let savedSearchHost = container.querySelector('.lt-search-host') as HTMLElement | null
+    if (!savedSearchHost) {
+      savedSearchHost = el('div', { class: 'lt-search-host' })
+    }
+    // Build/rebuild the persistent search input outside the rebuilt zone
+    savedSearchHost.innerHTML = ''
+    const search = buildSearch(view.tagQuery, (value) => store.actions.setTagQuery(value))
+    savedSearchHost.appendChild(field('Search', search))
 
     teardown()
     clear(container)
+    container.appendChild(savedSearchHost)
 
     const root = sectionEl('lt-box')
     root.appendChild(renderToolbar(view))
@@ -764,19 +767,9 @@ export function renderTagsSection(options: {
 
     container.appendChild(root)
 
-    if (savedSearchInput) {
-      const rebuilt = root.querySelector('input.lt-search') as HTMLInputElement | null
-      if (rebuilt && rebuilt.parentElement) {
-        savedSearchInput.value = view.tagQuery
-        rebuilt.parentElement.replaceChild(savedSearchInput, rebuilt)
-        track(on(savedSearchInput, 'input', () => store.actions.setTagQuery(savedSearchInput!.value)))
-        track(on(savedSearchInput, 'focus', () => { searchFocusIntent = true }))
-        track(on(savedSearchInput, 'blur', () => { searchFocusIntent = false }))
-        track(on(savedSearchInput, 'keyup', () => { searchCaret = savedSearchInput!.selectionStart ?? savedSearchInput!.value.length }))
-      }
-    }
-
-    restoreSearchFocus(root)
+    // The persistent search input lives in savedSearchHost, not in root,
+    // so focus is preserved automatically. Only restore if it moved.
+    restoreSearchFocus(savedSearchHost)
   }
 
   render()
