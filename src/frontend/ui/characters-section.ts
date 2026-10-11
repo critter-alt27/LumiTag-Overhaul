@@ -1067,6 +1067,15 @@ export function renderCharactersSection(options: {
     if (destroyed) return
     const view = store.view
 
+    const active = document.activeElement as HTMLInputElement | null
+    for (const [slot, intent] of searchIntents) {
+      const input = document.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
+      if (input && active === input) {
+        intent.focused = true
+        intent.caret = input.selectionStart ?? input.value.length
+      }
+    }
+
     teardown()
     clear(container)
 

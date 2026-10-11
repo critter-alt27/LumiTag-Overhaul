@@ -965,7 +965,7 @@ export const LUMITAG_CSS = `
 .lt-app__failure-region { min-height: 0; }
 
 .lt-failures {
-  position: sticky;
+  position: relative;
   bottom: 0;
   z-index: 2;
   margin-top: auto;

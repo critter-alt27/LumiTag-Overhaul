@@ -727,6 +727,14 @@ export function renderTagsSection(options: {
     if (destroyed) return
     const view = store.view
 
+    const active = document.activeElement as HTMLInputElement | null
+    const wasFocused = active?.classList.contains('lt-search')
+    const prevValue = wasFocused ? active.value : ''
+    const prevCaret = wasFocused ? (active.selectionStart ?? 0) : 0
+    const prevEnd = wasFocused ? (active.selectionEnd ?? 0) : 0
+    searchFocusIntent = wasFocused
+    searchCaret = prevCaret
+
     teardown()
     clear(container)
 
