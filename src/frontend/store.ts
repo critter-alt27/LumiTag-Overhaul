@@ -306,6 +306,29 @@ export class TagManagerStore {
   private snapshot: StoreView
   private disposed = false
 
+  // Cache expensive derived section rows. Most commits (e.g. report visibility,
+  // loading flags, or changing sections) do not affect either list.
+  private tagRowsCache: {
+    tagIndex: TagIndex
+    characters: LumiTagCharacter[]
+    query: string
+    sort: TagSortMode
+    expanded: string
+    selectedTags: string
+    selectedCharacters: string
+    value: ReturnType<TagManagerStore['computeTagRows']>
+  } | null = null
+  private characterRowsCache: {
+    characters: LumiTagCharacter[]
+    tagIndex: TagIndex
+    query: string
+    sort: CharacterSortMode
+    filter: CharacterTagFilter
+    filterTags: string
+    selectedCharacters: string
+    value: ReturnType<TagManagerStore['computeCharacterRows']>
+  } | null = null
+
   /** Bumped on every real change; the shell uses it to skip redundant renders. */
   version = 0
 
@@ -597,6 +620,21 @@ export class TagManagerStore {
     characters: CharacterListRow[]
   } {
     const s = this.state
+    const expanded = [...s.expandedTagKeys].sort().join('\\u0000')
+    const selectedTags = [...s.selectedTagKeys].sort().join('\\u0000')
+    const selectedCharacters = [...s.selectedCharacterIds].sort().join('\\u0000')
+    const cached = this.tagRowsCache
+    if (
+      cached &&
+      cached.tagIndex === s.tagIndex &&
+      cached.characters === s.characters &&
+      cached.query === s.tagQuery &&
+      cached.sort === s.tagSort &&
+      cached.expanded === expanded &&
+      cached.selectedTags === selectedTags &&
+      cached.selectedCharacters === selectedCharacters
+    ) return cached.value
+
     const parsed = parseQuery(s.tagQuery)
     const isCharacterMode = hasCharacterQueryTerm(parsed.query)
 
@@ -632,11 +670,35 @@ export class TagManagerStore {
       characters.sort((a, b) => compareStrings(nameKey(a.character), nameKey(b.character)))
     }
 
-    return { rows, errors: parsed.errors, isCharacterMode, characters }
+    const value = { rows, errors: parsed.errors, isCharacterMode, characters }
+    this.tagRowsCache = {
+      tagIndex: s.tagIndex,
+      characters: s.characters,
+      query: s.tagQuery,
+      sort: s.tagSort,
+      expanded,
+      selectedTags,
+      selectedCharacters,
+      value,
+    }
+    return value
   }
 
   private computeCharacterRows(): { rows: CharacterListRow[]; errors: QuerySyntaxError[] } {
     const s = this.state
+    const filterTagsSignature = [...s.activeFilterTagKeys].sort().join('\\u0000')
+    const selectedCharacters = [...s.selectedCharacterIds].sort().join('\\u0000')
+    const cached = this.characterRowsCache
+    if (
+      cached &&
+      cached.characters === s.characters &&
+      cached.tagIndex === s.tagIndex &&
+      cached.query === s.characterQuery &&
+      cached.sort === s.characterSort &&
+      cached.filter === s.characterTagFilter &&
+      cached.filterTags === filterTagsSignature &&
+      cached.selectedCharacters === selectedCharacters
+    ) return cached.value
 
     // The query is ALWAYS evaluated, including when it failed to parse: the
     // parser returns a best-effort query alongside its errors, and hiding
@@ -700,7 +762,18 @@ export class TagManagerStore {
       }
     })
 
-    return { rows, errors: parsed.errors }
+    const value = { rows, errors: parsed.errors }
+    this.characterRowsCache = {
+      characters: s.characters,
+      tagIndex: s.tagIndex,
+      query: s.characterQuery,
+      sort: s.characterSort,
+      filter: s.characterTagFilter,
+      filterTags: filterTagsSignature,
+      selectedCharacters,
+      value,
+    }
+    return value
   }
 
   private computeView(): StoreView {
