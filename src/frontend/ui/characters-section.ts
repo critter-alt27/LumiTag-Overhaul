@@ -323,12 +323,14 @@ export function renderCharactersSection(options: {
   /** Give every rebuilt search box its focus and caret back. */
   const restoreSearchIntents = (root: HTMLElement): void => {
     for (const [slot, intent] of searchIntents) {
-      if (!intent.focused) continue
+      const savedValue = pickerQueries.get(slot) ?? ''
+      const savedCaret = intent.caret
+      if (savedValue === '' && savedCaret === 0) continue
       const input = root.querySelector(`input[data-lt-search="${slot}"]`)
       if (!(input instanceof HTMLInputElement)) continue
       input.focus()
       try {
-        const caret = Math.min(intent.caret, input.value.length)
+        const caret = Math.min(savedCaret, input.value.length)
         input.setSelectionRange(caret, caret)
       } catch {
         // Some engines reject selection APIs on `type="search"`; focus alone

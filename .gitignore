@@ -11,4 +11,5 @@ coverage/
 # extension, so re-include them. A .gitignore in a deeper directory takes
 # precedence over shallower patterns.
 DEVELOPMENT_NOTES.md
+FOCUS-ROOT-CAUSE-REPORT.md
 !README.md

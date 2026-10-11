@@ -244,12 +244,12 @@ export function renderTagsSection(options: {
 
   /** Give the rebuilt search box its focus and caret back after a re-render. */
   const restoreSearchFocus = (root: HTMLElement): void => {
-    if (!searchFocusIntent) return
     const input = root.querySelector('input.lt-search')
     if (!(input instanceof HTMLInputElement)) return
+    if (prevValue === '' && prevCaret === 0) return
     input.focus()
     try {
-      const caret = Math.min(searchCaret, input.value.length)
+      const caret = Math.min(prevCaret, input.value.length)
       input.setSelectionRange(caret, caret)
     } catch {
       // Some engines reject selection APIs on `type="search"`; focus alone
