@@ -348,9 +348,10 @@ export function renderCharactersSection(options: {
   const renderToolbar = (view: StoreView): HTMLElement => {
     const bar = el('div', { class: 'lt-toolbar', role: 'toolbar', 'aria-label': 'Character actions' })
 
-    const search = buildSearch('characters', 'Search characters and their tags', view.characterQuery, (value) =>
-      store.actions.setCharacterQuery(value),
-    )
+    const search = buildSearch('characters', 'Search characters and their tags', view.characterQuery, (value) => {
+      if (searchTimer) clearTimeout(searchTimer)
+      searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), 1000)
+    })
     bar.appendChild(el('div', { class: 'lt-toolbar__grow' }, [field('Search', search)]))
 
     bar.appendChild(
