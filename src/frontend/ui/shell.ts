@@ -171,24 +171,17 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     teardownListeners()
     clear(root)
 
-    const app = el('div', { class: 'lt-app' })
-
-    // Attach before the children are built, not after. The sections and the
-    // failure panel restore focus into their freshly built controls, and
-    // `focus()` on a detached subtree is a no-op — attaching first is what
-    // makes that restoration (search caret on every keystroke) actually work.
-    root.appendChild(app)
-
-    app.appendChild(renderHeader(view))
-    app.appendChild(renderTabs(view))
-    app.appendChild(renderMeta(view))
+    // root (tab.root) already carries .lt-app from app.ts; don't nest.
+    root.appendChild(renderHeader(view))
+    root.appendChild(renderTabs(view))
+    root.appendChild(renderMeta(view))
 
     sectionHost = el('div', { class: 'lt-app__body' })
-    app.appendChild(sectionHost)
+    root.appendChild(sectionHost)
     renderSection(view, sectionHost)
 
     failureHost = el('div', { class: 'lt-app__failure-region' })
-    app.appendChild(failureHost)
+    root.appendChild(failureHost)
     options.renderFailurePanel(failureHost)
 
     // The body is populated and attached now, so `scrollHeight` is meaningful

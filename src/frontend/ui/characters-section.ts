@@ -161,6 +161,8 @@ const tagRowsExpanded = new Map<string, boolean>()
  * {@link pickerDefaultOpen}.
  */
 const pickerOpenState = new Map<string, boolean>()
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+let pickerTimer: ReturnType<typeof setTimeout> | null = null
 
 /**
  * Whether a tag picker with no remembered toggle starts open.
@@ -323,12 +325,14 @@ export function renderCharactersSection(options: {
   /** Give every rebuilt search box its focus and caret back. */
   const restoreSearchIntents = (root: HTMLElement): void => {
     for (const [slot, intent] of searchIntents) {
-      if (!intent.focused) continue
+      const savedValue = pickerQueries.get(slot) ?? ''
+      const savedCaret = intent.caret
+      if (savedValue === '' && savedCaret === 0) continue
       const input = root.querySelector(`input[data-lt-search="${slot}"]`)
       if (!(input instanceof HTMLInputElement)) continue
       input.focus()
       try {
-        const caret = Math.min(intent.caret, input.value.length)
+        const caret = Math.min(savedCaret, input.value.length)
         input.setSelectionRange(caret, caret)
       } catch {
         // Some engines reject selection APIs on `type="search"`; focus alone
@@ -344,9 +348,10 @@ export function renderCharactersSection(options: {
   const renderToolbar = (view: StoreView): HTMLElement => {
     const bar = el('div', { class: 'lt-toolbar', role: 'toolbar', 'aria-label': 'Character actions' })
 
-    const search = buildSearch('characters', 'Search characters and their tags', view.characterQuery, (value) =>
-      store.actions.setCharacterQuery(value),
-    )
+    const search = buildSearch('characters', 'Search characters and their tags', view.characterQuery, (value) => {
+      if (searchTimer) clearTimeout(searchTimer)
+      searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), 1000)
+    })
     bar.appendChild(el('div', { class: 'lt-toolbar__grow' }, [field('Search', search)]))
 
     bar.appendChild(
@@ -495,16 +500,12 @@ export function renderCharactersSection(options: {
       config.searchLabel,
       config.searchValue,
       (value) => {
-        // The picker's own text filter is pure view state: it is never a
-        // mutation, so it goes to module state and never touches the store.
-        pickerQueries.set(config.searchSlot, value)
-        // Typing is an explicit request to see the results, and the search box
-        // is only reachable while the disclosure is open — so without this a
-        // re-render could snap the block shut around the keystroke that was
-        // meant to filter it. A remembered "closed" would win over the default
-        // otherwise, since the reader did close it.
-        pickerOpenState.set(config.searchSlot, true)
-        render()
+        if (pickerTimer) clearTimeout(pickerTimer)
+        pickerTimer = setTimeout(() => {
+          pickerQueries.set(config.searchSlot, value)
+          pickerOpenState.set(config.searchSlot, true)
+          render()
+        }, 1000)
       },
     )
     body.appendChild(field('Find a tag', search))
@@ -1067,6 +1068,21 @@ export function renderCharactersSection(options: {
     if (destroyed) return
     const view = store.view
 
+    const active = document.activeElement as HTMLInputElement | null
+    for (const [slot, intent] of searchIntents) {
+      const input = document.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
+      if (input && active === input) {
+        intent.focused = true
+        intent.caret = input.selectionStart ?? input.value.length
+      }
+    }
+
+    const savedInputs = new Map<string, HTMLInputElement>()
+    for (const [slot] of searchIntents) {
+      const input = document.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
+      if (input) savedInputs.set(slot, input)
+    }
+
     teardown()
     clear(container)
 
@@ -1089,6 +1105,23 @@ export function renderCharactersSection(options: {
 
     root.appendChild(renderActiveFilterPicker(view))
 
+    // Bulk tag assignment block at the top, collapsible
+    const bulkHost = el('div', { class: 'lt-bulk-host' })
+    const bulkHeader = el('button', { class: 'lt-bulk-host__toggle', type: 'button', 'aria-expanded': 'true', 'aria-label': 'Toggle bulk tag assignment block' })
+    bulkHeader.appendChild(el('span', { class: 'lt-bulk-host__label' }, ['Bulk Tag Assignment']))
+    bulkHeader.appendChild(el('span', { class: 'lt-bulk-host__indicator' }, ['▾']))
+    const bulkContent = el('div', { class: 'lt-bulk-host__content' })
+    bulkContent.appendChild(renderBulkToolbar(view))
+    bulkHost.appendChild(bulkHeader)
+    bulkHost.appendChild(bulkContent)
+    track(on(bulkHeader, 'click', () => {
+      const open = bulkContent.style.display !== 'none'
+      bulkContent.style.display = open ? 'none' : ''
+      bulkHeader.setAttribute('aria-expanded', open ? 'false' : 'true')
+      bulkHeader.querySelector('.lt-bulk-host__indicator')!.textContent = open ? '▸' : '▾'
+    }))
+    root.appendChild(bulkHost)
+
     if (view.loadState === 'loading') {
       root.appendChild(spinner('Loading characters…'))
       container.appendChild(root)
@@ -1097,9 +1130,42 @@ export function renderCharactersSection(options: {
     }
 
     root.appendChild(renderCharacterList(view))
-    root.appendChild(renderBulkToolbar(view))
 
     container.appendChild(root)
+
+    for (const [slot, input] of savedInputs) {
+      const rebuilt = root.querySelector(`input[data-lt-search="${slot}"]`) as HTMLInputElement | null
+      if (rebuilt && rebuilt.parentElement) {
+        rebuilt.parentElement.replaceChild(input, rebuilt)
+        if (slot === 'characters') input.value = view.characterQuery
+        else input.value = pickerQueries.get(slot) ?? ''
+        track(on(input, 'input', () => {
+          if (searchTimer) clearTimeout(searchTimer)
+          if (slot === 'characters') {
+            searchTimer = setTimeout(() => store.actions.setCharacterQuery(input.value), 1000)
+          } else {
+            pickerTimer = setTimeout(() => {
+              pickerQueries.set(slot, input.value)
+              pickerOpenState.set(slot, true)
+              render()
+            }, 1000)
+          }
+        }))
+      }
+    }
+  for (const [slot] of savedInputs) {
+    const intent = searchIntents.get(slot)
+    if (intent && intent.focused) {
+      const input = savedInputs.get(slot)!
+      input.focus()
+      try {
+        const caret = Math.min(intent.caret, input.value.length)
+        input.setSelectionRange(caret, caret)
+      } catch { /* ignore */ }
+    }
+  }
+
+
     restoreSearchIntents(root)
   }
 
