@@ -19,6 +19,7 @@ export type BackendRequest =
   | { type: 'characters.get'; requestId: string; characterId: string }
   | { type: 'characters.updateTags'; requestId: string; characterId: string; tags: string[] }
   | { type: 'characters.updateTagsBatch'; requestId: string; updates: { characterId: string; tags: string[] }[] }
+  | { type: 'characters.updateTagsBatch.cancel'; requestId: string }
   | { type: 'characters.getBatch'; requestId: string; characterIds: string[] }
 
 export type BackendResponse =
