@@ -756,7 +756,7 @@ export function renderTagsSection(options: {
     // Direct listener, not tracked — survives teardown()
     search.addEventListener('input', () => {
       if (searchTimer) clearTimeout(searchTimer)
-      searchTimer = setTimeout(() => store.actions.setTagQuery(search.value), 2000)
+      searchTimer = setTimeout(() => store.actions.setTagQuery(search.value), 1000)
     })
     search.addEventListener('focus', () => { searchFocusIntent = true })
     search.addEventListener('blur', () => { searchFocusIntent = false })

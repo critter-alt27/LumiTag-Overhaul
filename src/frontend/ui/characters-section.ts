@@ -504,7 +504,7 @@ export function renderCharactersSection(options: {
           pickerQueries.set(config.searchSlot, value)
           pickerOpenState.set(config.searchSlot, true)
           render()
-        }, 2000)
+        }, 1000)
       },
     )
     body.appendChild(field('Find a tag', search))
@@ -1141,13 +1141,13 @@ export function renderCharactersSection(options: {
         track(on(input, 'input', () => {
           if (searchTimer) clearTimeout(searchTimer)
           if (slot === 'characters') {
-            searchTimer = setTimeout(() => store.actions.setCharacterQuery(input.value), 2000)
+            searchTimer = setTimeout(() => store.actions.setCharacterQuery(input.value), 1000)
           } else {
             pickerTimer = setTimeout(() => {
               pickerQueries.set(slot, input.value)
               pickerOpenState.set(slot, true)
               render()
-            }, 2000)
+            }, 1000)
           }
         }))
       }
