@@ -1,15 +1,29 @@
-import type { BackendResponse } from '../shared/protocol'
-import { BACKEND_PAGE_LIMIT, type CharacterListPage, type LumiTagCharacter } from '../shared/types'
-import { mapWithConcurrency } from './concurrency'
+import type { BackendResponse, BatchFailure } from '../shared/protocol'
+import {
+  BACKEND_PAGE_LIMIT,
+  type CharacterListPage,
+  type CharacterTags,
+  type LumiTagCharacter,
+} from '../shared/types'
 import type { SpindleRpc } from './rpc'
 
-/** Default number of simultaneous character `get` roundtrips. */
-export const DEFAULT_GET_CONCURRENCY = 8
-
-/** The narrow mutation surface the executor is allowed to depend on. */
+/**
+ * The narrow mutation surface the executor is allowed to depend on.
+ *
+ * Both granularities are part of the contract. `execute()` uses ONLY the batch
+ * methods — one message for the whole operation — because a per-character
+ * round trip per character is what exhausted the host on large bulk edits. The
+ * single-character methods stay because the retry path re-reads exactly one
+ * character on purpose: a retry's safety depends on seeing that one record's
+ * current tags before deciding what to write.
+ */
 export interface CharacterMutationPort {
   getCharacter(id: string): Promise<LumiTagCharacter | null>
   updateTags(id: string, tags: string[]): Promise<LumiTagCharacter>
+  getTagsBatch(ids: readonly string[]): Promise<Map<string, CharacterTags>>
+  updateTagsBatch(
+    updates: { characterId: string; tags: string[] }[],
+  ): Promise<{ updated: CharacterTags[]; failures: BatchFailure[] }>
 }
 
 function clampLimit(value: number | undefined): number {
@@ -96,36 +110,6 @@ export class CharacterRepository implements CharacterMutationPort {
   }
 
   /**
-   * Fetch many characters with BOUNDED concurrency (never `Promise.all` over an
-   * unbounded list, which would open one socket per character).
-   *
-   * Per-character failures are intentionally non-fatal: the id is simply
-   * absent from the map. Bulk operations are partial-success by design, and one
-   * deleted-character race must not abort a whole batch.
-   */
-  async getCharactersByIds(
-    ids: readonly string[],
-    concurrency: number = DEFAULT_GET_CONCURRENCY,
-  ): Promise<Map<string, LumiTagCharacter>> {
-    const out = new Map<string, LumiTagCharacter>()
-    if (ids.length === 0) return out
-
-    // De-duplicate up front so repeated ids do not burn a roundtrip each.
-    const unique = [...new Set(ids)]
-
-    const settled = await mapWithConcurrency(unique, concurrency, async (id) => this.getCharacter(id))
-
-    for (let i = 0; i < settled.length; i++) {
-      const result = settled[i]
-      if (!result || result.status !== 'fulfilled') continue
-      const character = result.value
-      if (character) out.set(unique[i] as string, character)
-    }
-
-    return out
-  }
-
-  /**
    * Replace a character's tag array.
    *
    * Errors propagate UNMODIFIED. The executor classifies retryable vs terminal
@@ -140,6 +124,66 @@ export class CharacterRepository implements CharacterMutationPort {
     })
     const result = response as Extract<BackendResponse, { type: 'characters.updateTags.result' }>
     return result.character
+  }
+
+  /**
+   * Replace the tag arrays of many characters in ONE round trip.
+   *
+   * Whole-request errors propagate UNMODIFIED, exactly like {@link updateTags}:
+   * the executor classifies retryable vs terminal failures from
+   * `SpindleRpcError.code` / `.retryable`, so this must not catch-and-rethrow.
+   *
+   * Per-character failures are NOT thrown — they arrive as data in
+   * `failures[]`, because the request itself succeeded and only those items did
+   * not. The caller marks exactly those characters failed and treats the rest as
+   * written, which is what keeps one deleted-character race from discarding a
+   * whole bulk edit.
+   *
+   * The reply is tags-only by design: nothing in the bulk path reads a
+   * character's prompt body, so shipping it would be payload for no behaviour.
+   */
+  async updateTagsBatch(
+    updates: { characterId: string; tags: string[] }[],
+  ): Promise<{ updated: CharacterTags[]; failures: BatchFailure[] }> {
+    if (updates.length === 0) return { updated: [], failures: [] }
+
+    const response = await this.rpc.request<BackendResponse['type']>({
+      type: 'characters.updateTagsBatch',
+      updates,
+    })
+    const result = response as Extract<BackendResponse, { type: 'characters.updateTagsBatch.result' }>
+    return {
+      updated: Array.isArray(result.updated) ? result.updated : [],
+      failures: Array.isArray(result.failures) ? result.failures : [],
+    }
+  }
+
+  /**
+   * Re-read only the tag arrays of many characters, in ONE round trip.
+   *
+   * Tags-only by design: after a bulk edit the only thing that can have
+   * changed locally is a character's tags, and merging a full DTO would
+   * overwrite fields this store never re-reads. Ids the backend could not read
+   * are simply absent from the map, which is the honest reading of a read that
+   * did not happen.
+   */
+  async getTagsBatch(ids: readonly string[]): Promise<Map<string, CharacterTags>> {
+    const out = new Map<string, CharacterTags>()
+    if (ids.length === 0) return out
+
+    const response = await this.rpc.request<BackendResponse['type']>({
+      type: 'characters.getBatch',
+      characterIds: [...new Set(ids)],
+    })
+    const result = response as Extract<BackendResponse, { type: 'characters.getBatch.result' }>
+    if (!Array.isArray(result.characters)) return out
+
+    for (const entry of result.characters) {
+      if (typeof entry?.id === 'string' && entry.id !== '') {
+        out.set(entry.id, { id: entry.id, tags: Array.isArray(entry.tags) ? entry.tags : [] })
+      }
+    }
+    return out
   }
 
   /**

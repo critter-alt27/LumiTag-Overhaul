@@ -269,26 +269,31 @@ describe('planOperation — remove / delete', () => {
     expect(preview.skipped.every((s) => s.reason === 'tag not present')).toBe(true)
   })
 
-  test('14. bulk delete: a character with both tags yields TWO mutations sharing one targetTags', () => {
+  test('14. bulk delete: one mutation per character, removedTags is the union of all sources', () => {
     const preview = planOperation(FIXTURE, { op: 'delete', tags: ['Elf', 'Dark'] })
 
     expect(preview.label).toBe('Delete 2 tags')
     expect(preview.tags).toEqual(['Elf', 'Dark'])
 
-    // c4 carries both Elf and Dark → two distinct mutations for the SAME character.
+    // c4 carries both Elf and Dark. It is ONE write, so it is ONE mutation —
+    // and that mutation must carry BOTH removals, since the executor applies
+    // `removedTags` as one set against a single full-array replace.
     const c4Mutations = mutationsFor(preview, 'c4')
-    expect(c4Mutations).toHaveLength(2)
-    expect(c4Mutations.map((m) => m.tag).sort()).toEqual(['Dark', 'Elf'])
-    // Same intended final array on both, so one write satisfies both.
-    expect(c4Mutations[0].targetTags).toEqual(['Rogue'])
-    expect(c4Mutations[1].targetTags).toEqual(['Rogue'])
-    // ...but distinguishable per tag for the per-tag failure report.
-    expect(c4Mutations.find((m) => m.tag === 'Elf')!.removedTags).toEqual(['Elf'])
-    expect(c4Mutations.find((m) => m.tag === 'Dark')!.removedTags).toEqual(['Dark'])
-    expect(new Set(c4Mutations.map((m) => m.mutationId)).size).toBe(2)
+    expect(c4Mutations).toHaveLength(1)
+    const c4 = c4Mutations[0]!
+    expect(c4.sourceTags).toEqual(['Dark', 'Elf'])
+    expect(c4.removedTags).toEqual(['Dark', 'Elf'])
+    expect(c4.addedTags).toEqual([])
+    expect(c4.targetTags).toEqual(['Rogue'])
+    // The primary tag is the lowest tagKey of the set — deterministic, not
+    // "whichever the source list happened to start with".
+    expect(c4.tag).toBe('Dark')
+    expect(c4.intendedChange).toBe('Delete 2 tags ("Dark", "Elf") from Doran')
 
     expect(mutationsFor(preview, 'c1')).toHaveLength(1)
     expect(targetFor(preview, 'c1')).toEqual(['Magic'])
+    // A single-source character keeps the single-tag one-liner.
+    expect(mutationsFor(preview, 'c1')[0]!.intendedChange).toBe('Delete tag "Elf" from Ayla')
   })
 })
 
@@ -375,24 +380,24 @@ describe('planOperation — merge', () => {
     expect(mutationsFor(preview, 'm1')[0].addedTags).toEqual([])
   })
 
-  test('10. multiple targets on one character → one mutation per source, all sharing targetTags', () => {
+  test('10. multiple targets on one character → ONE mutation carrying the combined final array', () => {
     const set = [character('z1', 'Zed', ['Elf', 'Dark', 'Mage', 'Warrior'])]
     const preview = planOperation(set, { op: 'merge', primary: 'Magic', targets: ['Mage', 'Dark', 'Elf'] })
 
     expect(preview.label).toBe('Merge 3 tags → Magic')
     const mutations = mutationsFor(preview, 'z1')
-    expect(mutations).toHaveLength(3)
-    expect(mutations.map((m) => m.tag).sort()).toEqual(['Dark', 'Elf', 'Mage'])
-
-    // Every mutation for the character shares the SAME combined final array.
-    const targetTags = mutations[0].targetTags
-    expect(targetTags).toEqual(['Magic', 'Warrior'])
-    for (const mutation of mutations) {
-      expect(mutation.targetTags).toBe(targetTags)
-      expect(mutation.sourceTags).toEqual(['Mage', 'Dark', 'Elf'])
-      expect(mutation.destTag).toBe('Magic')
-    }
-    expect(new Set(mutations.map((m) => m.mutationId)).size).toBe(3)
+    // One write → one record, so the full tag arrays are not duplicated N times.
+    expect(mutations).toHaveLength(1)
+    const mutation = mutations[0]!
+    expect(mutation.sourceTags).toEqual(['Mage', 'Dark', 'Elf'])
+    expect(mutation.destTag).toBe('Magic')
+    // The combined final array: every source folded into Magic, Warrior kept.
+    expect(mutation.targetTags).toEqual(['Magic', 'Warrior'])
+    expect(mutation.addedTags).toEqual(['Magic'])
+    expect(mutation.removedTags).toEqual(['Elf', 'Dark', 'Mage'])
+    // Primary tag is the lowest tagKey, independent of the caller's order.
+    expect(mutation.tag).toBe('Dark')
+    expect(mutation.intendedChange).toBe('Merge 3 tags ("Mage", "Dark", "Elf") into "Magic" on Zed')
   })
 
   test('11. a target equal to the primary is rejected (case-insensitively)', () => {
@@ -439,6 +444,83 @@ describe('planOperation — merge', () => {
   })
 })
 
+describe('one mutation per character', () => {
+  /** `count` characters, each carrying ALL of `tags`. */
+  function bulk(count: number, tags: string[]): LumiTagCharacter[] {
+    return Array.from({ length: count }, (_, i) =>
+      character(`c${String(i + 1).padStart(4, '0')}`, `Char ${String(i + 1).padStart(4, '0')}`, tags),
+    )
+  }
+
+  test('a 300-character 5-tag delete is 300 mutations, not 1500', () => {
+    const set = bulk(300, ['Elf', 'Dark', 'Mage', 'Fire', 'Royal'])
+    const preview = planOperation(set, { op: 'delete', tags: ['Elf', 'Dark', 'Mage', 'Fire', 'Royal'] })
+
+    expect(preview.mutations).toHaveLength(300)
+    expect(new Set(preview.mutations.map((m) => m.characterId)).size).toBe(300)
+    // Every record carries all five removals — the full intent of its write.
+    for (const mutation of preview.mutations) {
+      expect(mutation.sourceTags).toHaveLength(5)
+      expect(mutation.removedTags).toHaveLength(5)
+      expect(mutation.targetTags).toEqual([])
+    }
+  })
+
+  test('a 300-character 5-tag merge is 300 mutations, not 1500', () => {
+    const set = bulk(300, ['Elf', 'Dark', 'Mage', 'Fire', 'Royal'])
+    const preview = planOperation(set, {
+      op: 'merge',
+      primary: 'Magic',
+      targets: ['Elf', 'Dark', 'Mage', 'Fire', 'Royal'],
+    })
+
+    expect(preview.mutations).toHaveLength(300)
+    expect(new Set(preview.mutations.map((m) => m.characterId)).size).toBe(300)
+    for (const mutation of preview.mutations) {
+      expect(mutation.sourceTags).toHaveLength(5)
+      expect(mutation.removedTags).toHaveLength(5)
+      // FULL-ARRAY REPLACE: the complete final array, Magic once, nothing lost.
+      expect(mutation.targetTags).toEqual(['Magic'])
+      expect(mutation.addedTags).toEqual(['Magic'])
+      expect(mutation.destTag).toBe('Magic')
+    }
+  })
+
+  test('unrelated tags survive the collapsed write', () => {
+    const set = [character('k1', 'Keep', ['Elf', 'Dark', 'Knight', 'Royal', 'Noble'])]
+    const removed = planOperation(set, { op: 'delete', tags: ['Elf', 'Dark'] })
+    expect(removed.mutations[0]!.targetTags).toEqual(['Knight', 'Royal', 'Noble'])
+
+    const merged = planOperation(set, { op: 'merge', primary: 'Magic', targets: ['Elf', 'Dark'] })
+    expect(merged.mutations[0]!.targetTags).toEqual(['Magic', 'Knight', 'Royal', 'Noble'])
+  })
+
+  test('the primary tag is the lowest tagKey, not the caller\'s first', () => {
+    const set = [character('q1', 'Q', ['Royal', 'Dark', 'Elf'])]
+    // Caller order is deliberately reversed; the primary must not follow it.
+    const preview = planOperation(set, { op: 'delete', tags: ['Royal', 'Dark', 'Elf'] })
+    expect(preview.mutations[0]!.tag).toBe('Dark')
+
+    const merge = planOperation(set, { op: 'merge', primary: 'Magic', targets: ['Royal', 'Dark', 'Elf'] })
+    expect(merge.mutations[0]!.tag).toBe('Dark')
+  })
+
+  test('skipped bookkeeping is unchanged: one entry per character per reason', () => {
+    // c2 and c6 carry neither tag — one skip entry each, as before.
+    const preview = planOperation(FIXTURE, { op: 'delete', tags: ['Elf', 'Dark'] })
+    expect(preview.skipped).toEqual([
+      { characterId: 'c2', characterName: 'Bran', reason: 'tag not present' },
+      { characterId: 'c6', characterName: 'Eli', reason: 'tag not present' },
+    ])
+    // Four mutations: c1, c3, c4, c5 — exactly the characters carrying a tag,
+    // each producing exactly ONE record however many sources it has.
+    expect(preview.mutations).toHaveLength(4)
+    expect(new Set(preview.mutations.map((m) => m.characterId))).toEqual(new Set(['c1', 'c3', 'c4', 'c5']))
+    // c4 carries both sources but is still a single skip-free record.
+    expect(mutationsFor(preview, 'c4')[0]!.removedTags).toEqual(['Dark', 'Elf'])
+  })
+})
+
 describe('identity and determinism', () => {
   test('15. two characters sharing a display name stay distinguishable', () => {
     const preview = planOperation(FIXTURE, { op: 'delete', tags: ['Elf'] })
@@ -451,35 +533,44 @@ describe('identity and determinism', () => {
     expect(preview.affectedCharacterIds).toContain('c5')
   })
 
-  test('16. mutationId is deterministic and unique per (opId, characterId, tagKey)', () => {
+  test('16. mutationId is a pure function of (opId, characterId) — stable across re-plans', () => {
     const a = planOperation(FIXTURE, { op: 'delete', tags: ['Elf', 'Dark'] })
     const b = planOperation(FIXTURE, { op: 'delete', tags: ['Elf', 'Dark'] })
 
-    // Re-planning the same input with the SAME opId yields identical ids.
-    const withSameOp = planOperation(FIXTURE, { op: 'delete', tags: ['Elf', 'Dark'] })
-    const idOfMutation = (p: OperationPreview, id: string, tag: string) =>
-      p.mutations.find((m) => m.characterId === id && m.tag === tag)!.mutationId
-
-    expect(idOfMutation(a, 'c4', 'Elf')).toBe(`${a.opId}:c4:elf`)
-    expect(idOfMutation(b, 'c4', 'Elf')).toBe(`${b.opId}:c4:elf`)
-    // A different opId must yield different ids, so a retry that mints a fresh
-    // opId cannot be confused with the original — while the SAME opId always
-    // reproduces the identical id (the derivation is pure).
-    expect(withSameOp.mutations.map((m) => m.mutationId)).not.toEqual(a.mutations.map((m) => m.mutationId))
-    const derived = (opId: string, characterId: string, tag: string) => `${opId}:${characterId}:${tag.toLowerCase().trim()}`
+    const derived = (opId: string, characterId: string) => `${opId}:${characterId}`
     for (const mutation of a.mutations) {
-      expect(mutation.mutationId).toBe(derived(a.opId, mutation.characterId, mutation.tag))
+      expect(mutation.mutationId).toBe(derived(a.opId, mutation.characterId))
     }
-    expect(derived('fixed-op', 'c3', 'Elf')).toBe(derived('fixed-op', 'c3', 'eLF'))
+    // The load-bearing property: the SAME opId re-planned over the SAME input
+    // reproduces byte-identical ids, so a retry cannot double-apply. Different
+    // opIds must still collide nowhere.
+    const idOf = (p: OperationPreview, id: string) => p.mutations.find((m) => m.characterId === id)!.mutationId
+    expect(idOf(a, 'c4')).toBe(`${a.opId}:c4`)
+    expect(idOf(b, 'c4')).toBe(`${b.opId}:c4`)
+    expect(idOf(a, 'c4')).not.toBe(idOf(b, 'c4'))
 
-    // Distinct character ids → distinct mutation ids, even for same-named chars.
-    const c3Id = a.mutations.find((m) => m.characterId === 'c3')!.mutationId
-    const c5Id = a.mutations.find((m) => m.characterId === 'c5')!.mutationId
-    expect(c3Id).not.toBe(c5Id)
+    // Re-planning the same operation re-derives the same id for every character
+    // it touches, so replaying it under the original opId reproduces the ids a
+    // retry looks up — the double-apply guard, asserted directly.
+    const again = planOperation(FIXTURE, { op: 'delete', tags: ['Elf', 'Dark'] })
+    expect(again.mutations.map((m) => derived(a.opId, m.characterId))).toEqual(
+      a.mutations.map((m) => m.mutationId),
+    )
 
-    // Case-variant tags collapse to the same tagKey in the id.
+    // The id does NOT depend on the tag: changing which tags the operation
+    // touches leaves the id for a given character byte-identical.
+    const narrow = planOperation(FIXTURE, { op: 'delete', tags: ['Elf'] })
+    const widened = planOperation(FIXTURE, { op: 'delete', tags: ['Elf', 'Dark'] })
+    const narrowTag = (p: OperationPreview, id: string) => p.mutations.find((m) => m.characterId === id)!.tag
+    expect(narrowTag(narrow, 'c4')).toBe('Elf')
+    expect(narrowTag(widened, 'c4')).toBe('Dark')
+    expect(`${narrow.opId}:c4`).toBe(`${widened.opId}:c4`.replace(widened.opId, narrow.opId))
+
+    // Distinct character ids → distinct ids, even for same-named characters.
+    expect(idOf(a, 'c3')).not.toBe(idOf(a, 'c5'))
+    // A case-variant input changes nothing about the id.
     const upper = planOperation(FIXTURE, { op: 'delete', tags: ['ELF'] })
-    expect(upper.mutations[0].mutationId).toBe(`${upper.opId}:c1:elf`)
+    expect(upper.mutations[0].mutationId).toBe(`${upper.opId}:c1`)
 
     // Globally unique across the whole preview.
     expect(new Set(a.mutations.map((m) => m.mutationId)).size).toBe(a.mutations.length)
@@ -513,21 +604,17 @@ describe('identity and determinism', () => {
     }
   })
 
-  test('ordering is by characterName, then characterId, then source tag', () => {
+  test('ordering is by characterName, then characterId', () => {
     const set = [
       character('z', 'Zoe', ['Elf', 'Dark']),
       character('a', 'Zoe', ['Elf', 'Dark']),
       character('m', 'Amy', ['Elf', 'Dark']),
     ]
     const preview = planOperation(set, { op: 'delete', tags: ['Dark', 'Elf'] })
-    const ordered = preview.mutations.map((m) => `${m.characterName}/${m.characterId}/${m.tag}`)
-    expect(ordered).toEqual([
-      'Amy/m/Dark',
-      'Amy/m/Elf',
-      'Zoe/a/Dark',
-      'Zoe/a/Elf',
-      'Zoe/z/Dark',
-      'Zoe/z/Elf',
+    expect(preview.mutations.map((m) => `${m.characterName}/${m.characterId}`)).toEqual([
+      'Amy/m',
+      'Zoe/a',
+      'Zoe/z',
     ])
   })
 })

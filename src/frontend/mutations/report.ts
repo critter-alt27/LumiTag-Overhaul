@@ -100,12 +100,21 @@ export interface OperationReport {
 
 /** A failed source→destination tag change, with every character that failed it. */
 export interface FailureGroup {
-  /** Stable group key: `${tagKey(tag)}->${tagKey(destTag)}` for rename/merge, else `tagKey(tag)`. */
+  /**
+   * Stable group key: the mutation's source tags sorted by `tagKey` and joined
+   * with `+`, then `->tagKey(destTag)` for rename/merge.
+   *
+   * The WHOLE source set is in the key, not just `tag`. A character is one
+   * write, so every source it carried failed in the same write and is retried
+   * by the same `retryGroup` call — a key naming only the primary would merge
+   * changes that cannot be retried together while splitting ones that can.
+   */
   key: string
   op: MutationOp
+  /** Primary source tag (see `PlannedMutation.tag`); `label` names the full set. */
   tag: string
   destTag?: string
-  /** UI label, e.g. 'Mage → Magic'. */
+  /** UI label, e.g. 'Mage → Magic' or 'Dark, Elf → Magic'. */
   label: string
   failures: MutationResult[]
 }
@@ -208,29 +217,66 @@ export function buildReport(
   }
 }
 
-/** The stable grouping key for a failed tag change. */
-export function failureGroupKey(r: MutationResult): string {
-  const source = tagKey(r.tag)
-  if ((r.op === 'rename' || r.op === 'merge') && typeof r.destTag === 'string') {
-    return `${source}->${tagKey(r.destTag)}`
+/**
+ * The source tags a single collapsed mutation carried, deduped and sorted by
+ * `tagKey`.
+ *
+ * Sorting is codepoint-wise and therefore locale-independent; a `sourceTags`
+ * order is the planner's caller order, which is not a group identity. Falls
+ * back to `tag` alone when `sourceTags` is empty, so a hand-built result (the
+ * chip-removal report) still groups correctly.
+ */
+function groupSourceTags(r: MutationResult): string[] {
+  const sources = Array.isArray(r.sourceTags) && r.sourceTags.length > 0 ? r.sourceTags : [r.tag]
+  const byKey = new Map<string, string>()
+  for (const source of sources) {
+    if (typeof source !== 'string') continue
+    const key = tagKey(source)
+    if (key === '' || byKey.has(key)) continue
+    byKey.set(key, source)
   }
-  return source
+  if (byKey.size === 0) return [r.tag]
+  return [...byKey.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([, name]) => name)
 }
 
-/** The human label for a failed tag change. */
+function isDestinationOp(r: MutationResult): boolean {
+  return (r.op === 'rename' || r.op === 'merge') && typeof r.destTag === 'string'
+}
+
+/**
+ * The stable grouping key for a failed tag change.
+ *
+ * Keyed by the mutation's FULL source set, not its primary `tag`: one write
+ * covers every source at once, so retrying one covers the rest.
+ */
+export function failureGroupKey(r: MutationResult): string {
+  const sources = groupSourceTags(r)
+  const key = sources.map((tag) => tagKey(tag)).join('+')
+  return isDestinationOp(r) ? `${key}->${tagKey(r.destTag as string)}` : key
+}
+
+/**
+ * The human label for a failed tag change, naming EVERY source the write
+ * touched so a collapsed multi-tag removal or merge never reads as a
+ * single-tag one.
+ */
 export function failureGroupLabel(r: MutationResult): string {
-  if ((r.op === 'rename' || r.op === 'merge') && typeof r.destTag === 'string' && r.destTag !== '') {
-    return `${r.tag} → ${r.destTag}`
-  }
-  return r.tag
+  const sources = groupSourceTags(r).join(', ')
+  return isDestinationOp(r) && (r.destTag as string) !== ''
+    ? `${sources} → ${r.destTag}`
+    : sources
 }
 
 /**
  * Group still-unresolved failures by the SPECIFIC tag change.
  *
- * Keying by character would be useless here: in a bulk delete the same
- * character can fail both its `Elf` and its `Dark` removal, and a
- * character-level group would hide which tag change actually needs retrying.
+ * Keying by character would be useless here: it would fold a character's
+ * unrelated failures into one row and hide which change actually needs
+ * retrying. With one mutation per character that risk is gone from the
+ * planner, but `groupFailures` still takes a bare `OperationReport`, so the
+ * grouping is derived from what the record SAYS it did — its full `sourceTags`
+ * — not from the character. A collapsed record therefore still separates a
+ * failed single-tag removal from a failed multi-tag one, and labels both fully.
  */
 export function groupFailures(report: OperationReport): FailureGroup[] {
   const byKey = new Map<string, FailureGroup>()

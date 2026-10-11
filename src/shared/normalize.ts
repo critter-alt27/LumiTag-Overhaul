@@ -1,4 +1,4 @@
-import type { LumiTagCharacter } from './types'
+import type { CharacterTags, LumiTagCharacter } from './types'
 
 function readString(value: unknown): string {
   return typeof value === 'string' ? value : ''
@@ -39,6 +39,12 @@ export function normalizeCharacterTags(tags: unknown): string[] {
   }
 
   return out
+}
+
+export function normalizeCharacterTagsOnly(raw: unknown): CharacterTags {
+  const source: Record<string, unknown> =
+    typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
+  return { id: readString(source.id), tags: normalizeCharacterTags(source.tags) }
 }
 
 /**

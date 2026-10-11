@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 
 import type { SpindleAPI } from 'lumiverse-spindle-types'
-import { normalizeCharacter, normalizeCharacterTags } from '../src/shared/normalize'
+import { normalizeCharacter, normalizeCharacterTags, normalizeCharacterTagsOnly } from '../src/shared/normalize'
 import type { BackendRequest, BackendResponse } from '../src/shared/protocol'
 import { BACKEND_PAGE_LIMIT, type LumiTagCharacter } from '../src/shared/types'
 import { mapWithConcurrency } from '../src/frontend/concurrency'
@@ -491,126 +491,6 @@ describe('CharacterRepository.listAllCharacters', () => {
 })
 
 /* -------------------------------------------------------------------------- */
-/* getCharactersByIds                                                         */
-/* -------------------------------------------------------------------------- */
-
-describe('CharacterRepository.getCharactersByIds', () => {
-  test('never exceeds the concurrency cap', async () => {
-    let inFlight = 0
-    let peak = 0
-    const releases: Array<() => void> = []
-
-    const rpc = {
-      request: async (req: unknown) => {
-        const { characterId } = req as { characterId: string }
-        inFlight += 1
-        peak = Math.max(peak, inFlight)
-        await new Promise<void>((resolve) => releases.push(resolve))
-        inFlight -= 1
-        return {
-          type: 'characters.get.result',
-          requestId: 'x',
-          character: character(characterId),
-        } as BackendResponse
-      },
-    }
-    const repo = new CharacterRepository(rpc as unknown as SpindleRpc)
-
-    const ids = Array.from({ length: 40 }, (_, i) => `c${i}`)
-    const pending = repo.getCharactersByIds(ids, 5)
-
-    // Let the scheduler start the initial batch, then release it one wave at a
-    // time so the pool is continuously exercised.
-    for (let wave = 0; wave < 12; wave++) {
-      await flush(3)
-      for (const release of releases.splice(0)) release()
-    }
-
-    const map = await pending
-    expect(peak).toBeLessThanOrEqual(5)
-    expect(peak).toBeGreaterThan(1)
-    expect(map.size).toBe(40)
-  })
-
-  test('omits ids whose character is null', async () => {
-    const rpc = {
-      request: async (req: unknown) => {
-        const { characterId } = req as { characterId: string }
-        const found = characterId === 'b' ? null : character(characterId)
-        return { type: 'characters.get.result', requestId: 'x', character: found } as BackendResponse
-      },
-    }
-
-    const map = await new CharacterRepository(rpc as unknown as SpindleRpc).getCharactersByIds(['a', 'b', 'c'])
-
-    expect(map.has('a')).toBe(true)
-    expect(map.has('b')).toBe(false)
-    expect(map.has('c')).toBe(true)
-  })
-
-  test('one failing id does not fail the whole call', async () => {
-    const rpc = {
-      request: async (req: unknown) => {
-        const { characterId } = req as { characterId: string }
-        if (characterId === 'bad') {
-          throw new SpindleRpcError('not_found', 'gone', false)
-        }
-        if (characterId === 'slow') {
-          await flush(4)
-        }
-        return { type: 'characters.get.result', requestId: 'x', character: character(characterId) } as BackendResponse
-      },
-    }
-
-    const map = await new CharacterRepository(rpc as unknown as SpindleRpc).getCharactersByIds([
-      'a',
-      'bad',
-      'c',
-      'slow',
-      'd',
-    ])
-
-    expect([...map.keys()].sort()).toEqual(['a', 'c', 'd', 'slow'])
-    expect(map.has('bad')).toBe(false)
-  })
-
-  test('deduplicates ids before issuing requests', async () => {
-    let calls = 0
-    const rpc = {
-      request: async (req: unknown) => {
-        calls += 1
-        const { characterId } = req as { characterId: string }
-        return { type: 'characters.get.result', requestId: 'x', character: character(characterId) } as BackendResponse
-      },
-    }
-
-    const map = await new CharacterRepository(rpc as unknown as SpindleRpc).getCharactersByIds([
-      'a',
-      'b',
-      'a',
-      'b',
-      'a',
-    ])
-
-    expect(calls).toBe(2)
-    expect(map.size).toBe(2)
-  })
-
-  test('returns an empty map for an empty id list without any request', async () => {
-    let calls = 0
-    const rpc = {
-      request: async () => {
-        calls += 1
-        throw new Error('should not be called')
-      },
-    }
-    const map = await new CharacterRepository(rpc as unknown as SpindleRpc).getCharactersByIds([])
-    expect(map.size).toBe(0)
-    expect(calls).toBe(0)
-  })
-})
-
-/* -------------------------------------------------------------------------- */
 /* mapWithConcurrency                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -733,12 +613,15 @@ interface SpindleReply {
  * `onFrontendMessage` is captured exactly once (at module import) the way the
  * real host does it, so `deliver` is the single entry point every test drives.
  * The character stubs succeed by default; `failNext` makes the *next* call
- * throw so the worker's error path can be exercised.
+ * throw so the worker's error path can be exercised, and `failIds` names
+ * specific characters so a batch can be exercised for PARTIAL success.
  */
 function createFakeSpindle() {
   const calls: SpindleCall[] = []
   const replies: SpindleReply[] = []
   const warnings: string[] = []
+  const records = new Map<string, Record<string, unknown>>()
+  const failIds = new Set<string>()
   let handler: ((payload: unknown, userId: string) => void) | null = null
   let failure: Error | null = null
 
@@ -750,14 +633,20 @@ function createFakeSpindle() {
         return { data: [character('c1')], total: 1 }
       },
       async get(...args: unknown[]) {
+        const id = args[0] as string
         calls.push({ method: 'get', args })
         if (failure) { const err = failure; failure = null; throw err }
-        return { id: 'c1', name: 'Character c1', tags: [] }
+        if (failIds.has(id)) throw new Error(`character ${id} not found`)
+        const record = records.get(id)
+        if (record) return record
+        return { id, name: `Character ${id}`, description: 'a long body'.repeat(50), tags: [] }
       },
       async update(...args: unknown[]) {
+        const id = args[0] as string
         calls.push({ method: 'update', args })
         if (failure) { const err = failure; failure = null; throw err }
-        return { id: 'c1', name: 'Character c1', tags: [] }
+        if (failIds.has(id)) throw new Error(`character ${id} not found`)
+        return { ...(records.get(id) ?? { id, name: `Character ${id}` }), ...(args[1] as object) }
       },
     },
     onFrontendMessage(fn: (payload: unknown, userId: string) => void) {
@@ -782,14 +671,20 @@ function createFakeSpindle() {
     calls,
     replies,
     warnings,
+    records,
+    failIds,
     reset() {
       calls.length = 0
       replies.length = 0
       warnings.length = 0
+      records.clear()
+      failIds.clear()
       failure = null
     },
     /** Make the next host character call reject, mimicking a host throw. */
     failNext(err: Error) { failure = err },
+    /** Seed the raw host DTO a character id resolves to. */
+    seed(id: string, raw: Record<string, unknown>) { records.set(id, raw) },
     /** Hand a frontend message to the worker with an envelope userId. */
     deliver(payload: unknown, userId: string) {
       if (!handler) throw new Error('backend never registered an onFrontendMessage handler')
@@ -907,5 +802,438 @@ describe('backend user-scope failure handling', () => {
     await flush()
 
     expect(host.replies[0]!.payload).toMatchObject({ code: 'forbidden', retryable: false })
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* normalizeCharacterTagsOnly                                                  */
+/* -------------------------------------------------------------------------- */
+
+describe('normalizeCharacterTagsOnly', () => {
+  test('keeps only the id and the normalized tags', () => {
+    const raw = {
+      id: 'c1',
+      name: 'Aria',
+      description: 'a very long body',
+      personality: 'x',
+      scenario: 'x',
+      creator: 'x',
+      creator_notes: 'x',
+      system_prompt: 'x',
+      tags: [' Elf ', 'elf', ' Wizard '],
+      image_id: 'img',
+      created_at: 1,
+      updated_at: 2,
+    }
+    // The bulky prompt fields are dropped entirely, not zero-filled: the whole
+    // point of the tags-only projection is the bytes it does not cross.
+    expect(normalizeCharacterTagsOnly(raw)).toEqual({ id: 'c1', tags: ['Elf', 'Wizard'] })
+    expect(Object.keys(normalizeCharacterTagsOnly(raw))).toEqual(['id', 'tags'])
+  })
+
+  test('never throws on garbage', () => {
+    expect(normalizeCharacterTagsOnly(null)).toEqual({ id: '', tags: [] })
+    expect(normalizeCharacterTagsOnly('nope')).toEqual({ id: '', tags: [] })
+    expect(normalizeCharacterTagsOnly([1, 2])).toEqual({ id: '', tags: [] })
+    expect(normalizeCharacterTagsOnly({ id: 7, tags: 'Elf' })).toEqual({ id: '', tags: [] })
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* Backend batch handlers                                                      */
+/* -------------------------------------------------------------------------- */
+
+describe('backend characters.updateTagsBatch', () => {
+  beforeEach(() => host.reset())
+
+  test('N characters cost ONE reply, and every host write is normalized', async () => {
+    host.deliver(
+      {
+        type: 'characters.updateTagsBatch',
+        requestId: 'b1',
+        updates: [
+          { characterId: 'c1', tags: [' Elf ', 'elf', ' Wizard '] },
+          { characterId: 'c2', tags: ['Dark'] },
+        ],
+      },
+      ENVELOPE_USER_ID,
+    )
+    await flush()
+
+    expect(host.replies).toHaveLength(1)
+    expect(host.calls.filter((c) => c.method === 'update')).toHaveLength(2)
+    expect(host.calls[0]!.args).toEqual(['c1', { tags: ['Elf', 'Wizard'] }, ENVELOPE_USER_ID])
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.updateTagsBatch.result' }>
+    expect(reply.updated.map((u) => u.id)).toEqual(['c1', 'c2'])
+    expect(reply.failures).toEqual([])
+    // Tags-only: no prompt body is shipped back for a bulk edit.
+    expect(Object.keys(reply.updated[0] as unknown as object)).toEqual(['id', 'tags'])
+  })
+
+  test('one failing character is a data-level failure; the rest still land', async () => {
+    host.failIds.add('bad')
+    host.deliver(
+      {
+        type: 'characters.updateTagsBatch',
+        requestId: 'b2',
+        updates: [
+          { characterId: 'ok1', tags: ['Elf'] },
+          { characterId: 'bad', tags: ['Elf'] },
+          { characterId: 'ok2', tags: ['Elf'] },
+        ],
+      },
+      ENVELOPE_USER_ID,
+    )
+    await flush()
+
+    // Still exactly one reply, and it is NOT an error reply.
+    expect(host.replies).toHaveLength(1)
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.updateTagsBatch.result' }>
+    expect(reply.type).toBe('characters.updateTagsBatch.result')
+    expect(reply.updated.map((u) => u.id)).toEqual(['ok1', 'ok2'])
+    expect(reply.failures).toEqual([
+      { characterId: 'bad', code: 'not_found', message: 'character bad not found', retryable: false },
+    ])
+  })
+
+  test('every character failing still answers once, with every failure', async () => {
+    host.failIds.add('c1')
+    host.failIds.add('c2')
+    host.deliver(
+      {
+        type: 'characters.updateTagsBatch',
+        requestId: 'b3',
+        updates: [
+          { characterId: 'c1', tags: ['Elf'] },
+          { characterId: 'c2', tags: ['Elf'] },
+        ],
+      },
+      ENVELOPE_USER_ID,
+    )
+    await flush()
+
+    expect(host.replies).toHaveLength(1)
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.updateTagsBatch.result' }>
+    expect(reply.updated).toEqual([])
+    expect(reply.failures.map((f) => f.characterId)).toEqual(['c1', 'c2'])
+  })
+
+  test('a malformed entry fails alone and the valid ones are still written', async () => {
+    host.deliver(
+      {
+        type: 'characters.updateTagsBatch',
+        requestId: 'b4',
+        updates: [
+          { characterId: '', tags: ['Elf'] },
+          { characterId: 'c2', tags: 'not-an-array' },
+          'garbage',
+          { characterId: 'c3', tags: ['Elf'] },
+        ],
+      },
+      ENVELOPE_USER_ID,
+    )
+    await flush()
+
+    expect(host.calls.filter((c) => c.method === 'update')).toHaveLength(1)
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.updateTagsBatch.result' }>
+    expect(reply.updated.map((u) => u.id)).toEqual(['c3'])
+    expect(reply.failures).toHaveLength(3)
+    expect(reply.failures.every((f) => f.code === 'invalid_input' && f.retryable === false)).toBe(true)
+  })
+
+  test('each entry is keyed by the id WE requested, not by what the host echoed', async () => {
+    // A host that omits or misnames the id on its update reply must not be able
+    // to desynchronise the frontend's per-character verification: the `id` in
+    // `updated` is a correlation key, and only the requested id is trustworthy.
+    for (const raw of [{ name: 'Aria', tags: [] }, { id: 'wrong-id', name: 'Aria', tags: [] }]) {
+      host.reset()
+      host.seed('c1', raw)
+      host.deliver(
+        { type: 'characters.updateTagsBatch', requestId: 'bk', updates: [{ characterId: 'c1', tags: ['Elf'] }] },
+        ENVELOPE_USER_ID,
+      )
+      await flush()
+
+      const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.updateTagsBatch.result' }>
+      expect(reply.updated).toEqual([{ id: 'c1', tags: ['Elf'] }])
+      expect(reply.failures).toEqual([])
+    }
+  })
+
+  test('an empty batch answers without touching the host', async () => {
+    host.deliver({ type: 'characters.updateTagsBatch', requestId: 'b5', updates: [] }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.calls).toHaveLength(0)
+    expect(host.replies[0]!.payload).toEqual({
+      type: 'characters.updateTagsBatch.result',
+      requestId: 'b5',
+      updated: [],
+      failures: [],
+    })
+  })
+
+  test('a non-array updates field is rejected as invalid input', async () => {
+    host.deliver({ type: 'characters.updateTagsBatch', requestId: 'b6', updates: 'nope' }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.calls).toHaveLength(0)
+    expect(host.replies[0]!.payload).toMatchObject({ type: 'error', code: 'invalid_input', retryable: false })
+  })
+
+  test('no user scope drops the batch without a host call', async () => {
+    host.deliver(
+      { type: 'characters.updateTagsBatch', requestId: 'b7', updates: [{ characterId: 'c1', tags: ['a'] }] },
+      '',
+    )
+    await flush()
+
+    expect(host.calls).toHaveLength(0)
+    expect(host.replies[0]!.payload).toMatchObject({ code: 'scope_unresolved', retryable: false })
+  })
+})
+
+describe('backend characters.getBatch', () => {
+  beforeEach(() => host.reset())
+
+  test('reads many characters in one message and answers tags-only', async () => {
+    host.seed('c1', { id: 'c1', name: 'Aria', description: 'x'.repeat(100), tags: ['Elf', 'elf'] })
+    host.deliver({ type: 'characters.getBatch', requestId: 'g1', characterIds: ['c1', 'c2'] }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.replies).toHaveLength(1)
+    expect(host.calls.filter((c) => c.method === 'get')).toHaveLength(2)
+    expect(host.calls[0]!.args).toEqual(['c1', ENVELOPE_USER_ID])
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.getBatch.result' }>
+    expect(reply.characters).toEqual([
+      { id: 'c1', tags: ['Elf'] },
+      { id: 'c2', tags: [] },
+    ])
+  })
+
+  test('an unreadable character is absent, not an error for the whole batch', async () => {
+    host.failIds.add('gone')
+    host.deliver({ type: 'characters.getBatch', requestId: 'g2', characterIds: ['c1', 'gone'] }, ENVELOPE_USER_ID)
+    await flush()
+
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.getBatch.result' }>
+    expect(reply.type).toBe('characters.getBatch.result')
+    expect(reply.characters.map((c) => c.id)).toEqual(['c1'])
+  })
+
+  test('ids are de-duplicated and unusable entries never reach the host', async () => {
+    host.deliver(
+      { type: 'characters.getBatch', requestId: 'g3', characterIds: ['c1', 'c1', '', 42, null] },
+      ENVELOPE_USER_ID,
+    )
+    await flush()
+
+    expect(host.calls).toHaveLength(1)
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.getBatch.result' }>
+    expect(reply.characters).toHaveLength(1)
+  })
+
+  test('an empty batch answers immediately without a host read', async () => {
+    host.deliver({ type: 'characters.getBatch', requestId: 'g4', characterIds: [] }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.calls).toHaveLength(0)
+    expect(host.replies[0]!.payload).toEqual({
+      type: 'characters.getBatch.result',
+      requestId: 'g4',
+      characters: [],
+    })
+  })
+
+  test('a non-array characterIds field is rejected as invalid input', async () => {
+    host.deliver({ type: 'characters.getBatch', requestId: 'g5', characterIds: {} }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.calls).toHaveLength(0)
+    expect(host.replies[0]!.payload).toMatchObject({ type: 'error', code: 'invalid_input' })
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* SpindleRpc — batch response validation                                       */
+/* -------------------------------------------------------------------------- */
+
+describe('SpindleRpc batch responses', () => {
+  test('resolves a well-formed updateTagsBatch reply', async () => {
+    const fake = createFakeCtx()
+    const rpc = new SpindleRpc(fake.ctx)
+    const pending = rpc.request({
+      type: 'characters.updateTagsBatch',
+      updates: [{ characterId: 'c1', tags: ['Elf'] }],
+    })
+    await flush()
+    expect(fake.sent[0]!.type).toBe('characters.updateTagsBatch')
+    fake.reply(fake.sent[0]!, {
+      type: 'characters.updateTagsBatch.result',
+      updated: [{ id: 'c1', tags: ['Elf'] }],
+      failures: [],
+    })
+    const result = await pending
+    expect(result.type).toBe('characters.updateTagsBatch.result')
+    rpc.dispose()
+  })
+
+  test('rejects an updateTagsBatch reply with a non-array failures field', async () => {
+    const fake = createFakeCtx()
+    const rpc = new SpindleRpc(fake.ctx)
+    const pending = rpc.request({
+      type: 'characters.updateTagsBatch',
+      updates: [{ characterId: 'c1', tags: ['Elf'] }],
+    })
+    await flush()
+    fake.reply(fake.sent[0]!, {
+      type: 'characters.updateTagsBatch.result',
+      updated: [{ id: 'c1', tags: ['Elf'] }],
+      failures: 'none' as unknown as [],
+    })
+    await expect(pending).rejects.toMatchObject({ code: 'protocol_error', retryable: false })
+    rpc.dispose()
+  })
+
+  test('rejects a batch reply whose entries are missing their tags array', async () => {
+    const fake = createFakeCtx()
+    const rpc = new SpindleRpc(fake.ctx)
+    const pending = rpc.request({ type: 'characters.getBatch', characterIds: ['c1'] })
+    await flush()
+    fake.reply(fake.sent[0]!, {
+      type: 'characters.getBatch.result',
+      characters: [{ id: 'c1' } as unknown as { id: string; tags: string[] }],
+    })
+    await expect(pending).rejects.toMatchObject({ code: 'protocol_error', retryable: false })
+    rpc.dispose()
+  })
+
+  test('a batch request may still be answered with an error reply', async () => {
+    const fake = createFakeCtx()
+    const rpc = new SpindleRpc(fake.ctx)
+    const pending = rpc.request({ type: 'characters.getBatch', characterIds: ['c1'] })
+    await flush()
+    fake.reply(fake.sent[0]!, {
+      type: 'error',
+      code: 'forbidden',
+      message: 'nope',
+      retryable: false,
+    })
+    await expect(pending).rejects.toMatchObject({ code: 'forbidden', retryable: false })
+    rpc.dispose()
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* Repository batch methods                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** Fake RPC stub that records every request body it is handed. */
+function batchRpc(reply: (req: Record<string, unknown>) => BackendResponse) {
+  const calls: Record<string, unknown>[] = []
+  const rpc = {
+    request: async (req: unknown) => {
+      calls.push(req as Record<string, unknown>)
+      return reply(req as Record<string, unknown>)
+    },
+  }
+  return { rpc: rpc as unknown as SpindleRpc, calls }
+}
+
+describe('CharacterRepository.updateTagsBatch', () => {
+  test('one request carries every update', async () => {
+    const { rpc, calls } = batchRpc(() => ({
+      type: 'characters.updateTagsBatch.result',
+      requestId: 'x',
+      updated: [{ id: 'c1', tags: ['Elf'] }, { id: 'c2', tags: ['Dark'] }],
+      failures: [],
+    }))
+
+    const result = await new CharacterRepository(rpc).updateTagsBatch([
+      { characterId: 'c1', tags: ['Elf'] },
+      { characterId: 'c2', tags: ['Dark'] },
+    ])
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toEqual({
+      type: 'characters.updateTagsBatch',
+      updates: [
+        { characterId: 'c1', tags: ['Elf'] },
+        { characterId: 'c2', tags: ['Dark'] },
+      ],
+    })
+    expect(result.updated).toHaveLength(2)
+    expect(result.failures).toEqual([])
+  })
+
+  test('an empty batch costs no request at all', async () => {
+    const { rpc, calls } = batchRpc(() => {
+      throw new Error('should not be called')
+    })
+    const result = await new CharacterRepository(rpc).updateTagsBatch([])
+    expect(calls).toHaveLength(0)
+    expect(result).toEqual({ updated: [], failures: [] })
+  })
+
+  test('per-item failures come back as data, not as a thrown error', async () => {
+    const failures = [{ characterId: 'c2', code: 'not_found', message: 'gone', retryable: false }]
+    const { rpc } = batchRpc(() => ({
+      type: 'characters.updateTagsBatch.result',
+      requestId: 'x',
+      updated: [{ id: 'c1', tags: ['Elf'] }],
+      failures,
+    }))
+
+    const result = await new CharacterRepository(rpc).updateTagsBatch([
+      { characterId: 'c1', tags: ['Elf'] },
+      { characterId: 'c2', tags: ['Elf'] },
+    ])
+    expect(result.failures).toEqual(failures)
+  })
+
+  test('a whole-request failure propagates UNMODIFIED, for the executor to classify', async () => {
+    const failure = new SpindleRpcError('timeout', 'request timed out', true)
+    const rpc = {
+      request: async () => {
+        throw failure
+      },
+    }
+    const repo = new CharacterRepository(rpc as unknown as SpindleRpc)
+    await expect(repo.updateTagsBatch([{ characterId: 'c1', tags: ['Elf'] }])).rejects.toBe(failure)
+  })
+})
+
+describe('CharacterRepository.getTagsBatch', () => {
+  test('one request for many ids, keyed by character id', async () => {
+    const { rpc, calls } = batchRpc(() => ({
+      type: 'characters.getBatch.result',
+      requestId: 'x',
+      characters: [{ id: 'c1', tags: ['Elf'] }, { id: 'c2', tags: [] }],
+    }))
+
+    const map = await new CharacterRepository(rpc).getTagsBatch(['c1', 'c2', 'c1'])
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toEqual({ type: 'characters.getBatch', characterIds: ['c1', 'c2'] })
+    expect(map.get('c1')).toEqual({ id: 'c1', tags: ['Elf'] })
+    expect(map.get('c2')).toEqual({ id: 'c2', tags: [] })
+  })
+
+  test('an unreadable character is simply absent from the map', async () => {
+    const { rpc } = batchRpc(() => ({
+      type: 'characters.getBatch.result',
+      requestId: 'x',
+      characters: [{ id: 'c1', tags: ['Elf'] }],
+    }))
+    const map = await new CharacterRepository(rpc).getTagsBatch(['c1', 'gone'])
+    expect(map.has('gone')).toBe(false)
+  })
+
+  test('an empty id list costs no request at all', async () => {
+    const { rpc, calls } = batchRpc(() => {
+      throw new Error('should not be called')
+    })
+    expect((await new CharacterRepository(rpc).getTagsBatch([])).size).toBe(0)
+    expect(calls).toHaveLength(0)
   })
 })

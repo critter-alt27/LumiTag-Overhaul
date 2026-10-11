@@ -1,13 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 
-import { MutationExecutor } from '../src/frontend/mutations/executor'
+import { classifyError, MutationExecutor } from '../src/frontend/mutations/executor'
 import type { CharacterRepository } from '../src/frontend/repository'
+import type { BatchFailure } from '../src/shared/protocol'
 import {
   TagManagerStore,
   type CharacterSortMode,
   type CharacterTagFilter,
 } from '../src/frontend/store'
-import type { LumiTagCharacter } from '../src/shared/types'
+import type { CharacterTags, LumiTagCharacter } from '../src/shared/types'
 import { BACKEND_PAGE_LIMIT } from '../src/shared/types'
 
 // ---------------------------------------------------------------------------
@@ -39,16 +40,24 @@ type WriteBehaviour =
  * A minimal in-memory stand-in for `CharacterRepository`.
  *
  * It is cast structurally: the store only ever calls `listAllCharacters`,
- * `getCharactersByIds`, `getCharacter`, `updateTags` and `avatarUrl`, and
+ * `getTagsBatch`, `getCharacter`, `updateTags` and `avatarUrl`, and
  * exercising the REAL `MutationExecutor` over this fake is what gives the store
  * tests genuine multi-write semantics (partial failure, retry, post-write
  * verification) rather than a mocked-out approximation.
+ *
+ * The batch methods behave like the real backend's: they apply the write script
+ * per character and report a failing character as a `failures[]` ENTRY, so a
+ * bulk edit is partial-success here exactly as it is in production.
  */
 class FakeRepository {
   readonly server = new Map<string, LumiTagCharacter>()
   readonly writeScript = new Map<string, WriteBehaviour[]>()
-  /** Every `getCharactersByIds` call, so "only the affected ids" is assertable. */
+  /** Ids the backend cannot read back, so they are dropped from a batch read. */
+  readonly hiddenFromBatchReads = new Set<string>()
+  /** Every batched read, so "only the affected ids" is assertable. */
   readonly batchGets: string[][] = []
+  /** Every batched write request, so "one round trip per operation" is assertable. */
+  readonly batchWrites: { characterId: string; tags: string[] }[][] = []
   /**
    * Every single-character `getCharacter` call.
    *
@@ -87,22 +96,25 @@ class FakeRepository {
     const total = all.length
     const out: LumiTagCharacter[] = []
     // Deliberately paginate so a test can prove `load()` never assumes one
-    // page holds the whole library.
+    // page holds the whole library. Records are copied out, exactly as the real
+    // repository hands over fresh DTOs: sharing the server's own objects would
+    // let a host-side write mutate the store's state behind its back.
     for (let offset = 0; offset < all.length; offset += this.listPageSize) {
       const page = all.slice(offset, offset + this.listPageSize)
-      out.push(...page)
+      out.push(...page.map((c) => ({ ...c, tags: [...c.tags] })))
       onProgress?.(out.length, total)
     }
     return out
   }
 
-  async getCharactersByIds(ids: readonly string[]): Promise<Map<string, LumiTagCharacter>> {
+  async getTagsBatch(ids: readonly string[]): Promise<Map<string, CharacterTags>> {
     const unique = [...new Set(ids)]
     this.batchGets.push(unique)
-    const out = new Map<string, LumiTagCharacter>()
+    const out = new Map<string, CharacterTags>()
     for (const id of unique) {
+      if (this.hiddenFromBatchReads.has(id)) continue
       const found = this.server.get(id)
-      if (found) out.set(id, { ...found, tags: [...found.tags] })
+      if (found) out.set(id, { id, tags: [...found.tags] })
     }
     return out
   }
@@ -123,6 +135,30 @@ class FakeRepository {
     found.tags = [...tags]
     found.updated_at += 1
     return { ...found, tags: [...found.tags] }
+  }
+
+  async updateTagsBatch(
+    updates: { characterId: string; tags: string[] }[],
+  ): Promise<{ updated: CharacterTags[]; failures: BatchFailure[] }> {
+    this.batchWrites.push(updates.map((u) => ({ characterId: u.characterId, tags: [...u.tags] })))
+
+    const updated: CharacterTags[] = []
+    const failures: BatchFailure[] = []
+    for (const update of updates) {
+      try {
+        const written = await this.updateTags(update.characterId, update.tags)
+        updated.push({ id: written.id, tags: [...written.tags] })
+      } catch (error) {
+        const classified = classifyError(error)
+        failures.push({
+          characterId: update.characterId,
+          code: classified.code ?? 'internal',
+          message: classified.message,
+          retryable: classified.retryable,
+        })
+      }
+    }
+    return { updated, failures }
   }
 
   avatarUrl(id: string): string {
@@ -1115,5 +1151,93 @@ describe('store search help', () => {
     expect(characters.length).toBeGreaterThan(0)
     expect(tags.map((s) => s.title)).toContain('Searching the tag list')
     expect(characters.map((s) => s.title)).toContain('Finding characters by their tags')
+  })
+})
+// ---------------------------------------------------------------------------
+// Batched transport + tags-only patch
+// ---------------------------------------------------------------------------
+
+describe('store batched write and re-read', () => {
+  test('a bulk edit costs ONE write request and ONE batched read', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runDeleteTags(['Elf'])
+
+    // Four characters, two round trips: the message channel is no longer
+    // paying per character, which is what exhausted the host on large edits.
+    expect(fake.batchWrites).toHaveLength(1)
+    expect(fake.batchWrites[0]?.map((u) => u.characterId).sort()).toEqual(['c1', 'c2'])
+    expect(fake.batchGets).toEqual([['c1', 'c2']])
+    expect(fake.listCalls).toBe(1)
+    expect(store.view.tagIndex.byKey.has('elf')).toBe(false)
+  })
+
+  test('the tags-only re-read preserves every other field of the character', async () => {
+    const fake = seeded()
+    fake.server.set('c1', {
+      ...character('c1', 'Aria', ['Elf', 'Magic']),
+      description: 'A long, hand-written description.',
+      personality: 'gruff',
+      scenario: 'a rainy city',
+      creator: 'someone',
+      creator_notes: 'notes',
+      system_prompt: 'prompt',
+      image_id: 'img-1',
+      updated_at: 99,
+    })
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runDeleteTags(['Elf'])
+
+    const aria = store.view.characters.find((c) => c.id === 'c1')
+    expect(aria?.tags).toEqual(['Magic'])
+    // Regression guard: a tags-only payload merged as a whole record would blank
+    // every one of these out, silently destroying the user's library view.
+    expect(aria?.name).toBe('Aria')
+    expect(aria?.description).toBe('A long, hand-written description.')
+    expect(aria?.personality).toBe('gruff')
+    expect(aria?.scenario).toBe('a rainy city')
+    expect(aria?.creator).toBe('someone')
+    expect(aria?.creator_notes).toBe('notes')
+    expect(aria?.system_prompt).toBe('prompt')
+    expect(aria?.image_id).toBe('img-1')
+    // Characters the write did not touch are left completely alone.
+    expect(store.view.characters.find((c) => c.id === 'c3')?.name).toBe('Cass')
+  })
+
+  test('a character the re-read could not fetch keeps the value already held', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    // The write lands, but the backend cannot read this one back, so it drops
+    // it from the reply — the same partial-success the real batch read has.
+    fake.hiddenFromBatchReads.add('c1')
+    await store.actions.runDeleteTags(['Elf'])
+
+    const aria = store.view.characters.find((c) => c.id === 'c1')
+    // Honest outcome: the locally known tags stand rather than being guessed at
+    // from a read that never happened. The operation report is where the failure
+    // of the write itself is surfaced.
+    expect(aria?.tags).toEqual(['Elf', 'Magic', 'Knight'])
+  })
+
+  test('a failed character in a bulk edit is reported, and the others are saved', async () => {
+    const fake = seeded()
+    fake.failWrites('c2', new Error('character c2 not found'), 5)
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runDeleteTags(['Elf'])
+
+    const report = store.view.reports.at(-1)
+    expect(report?.status).toBe('partially_completed')
+    expect(report?.results.filter((r) => r.state === 'failed').map((r) => r.characterId)).toEqual(['c2'])
+    expect(store.view.characters.find((c) => c.id === 'c1')?.tags).toEqual(['Magic', 'Knight'])
+    // The re-read confirms what actually landed: c2 still has the old tags.
+    expect(store.view.characters.find((c) => c.id === 'c2')?.tags).toEqual(['Elf', 'Dark'])
   })
 })
