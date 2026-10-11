@@ -781,7 +781,7 @@ export function renderTagsSection(options: {
     const toolbar = renderToolbar(view)
     const searchInput = buildSearch(view.tagQuery, (v) => {
       if (searchTimer) clearTimeout(searchTimer)
-      searchTimer = setTimeout(() => store.actions.setTagQuery(v), 1000)
+      searchTimer = setTimeout(() => store.actions.setTagQuery(v), 1500)
     })
     const searchBar = el('div', { class: 'lt-toolbar__search' })
     searchBar.appendChild(field('Search', searchInput))

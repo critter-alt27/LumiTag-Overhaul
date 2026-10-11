@@ -386,7 +386,7 @@ export function renderCharactersSection(options: {
 
     const search = buildSearch('characters', 'Search characters and their tags', view.characterQuery, (value) => {
       if (searchTimer) clearTimeout(searchTimer)
-      searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), 1000)
+      searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), 1500)
     })
     bar.appendChild(el('div', { class: 'lt-toolbar__grow' }, [field('Search', search)]))
 
@@ -532,7 +532,7 @@ export function renderCharactersSection(options: {
           pickerQueries.set(config.searchSlot, value)
           pickerOpenState.set(config.searchSlot, true)
           render()
-        }, 1000)
+        }, 1500)
       },
     )
     body.appendChild(field('Find a tag', search))
