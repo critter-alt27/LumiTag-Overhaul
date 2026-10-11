@@ -224,6 +224,10 @@ export function renderCharactersSection(options: {
 
   let disposers: (() => void)[] = []
   let destroyed = false
+  let prevSlot: string | null = null
+  let prevValue = ''
+  let prevSelectionStart = 0
+  let prevSelectionEnd = 0
 
   const track = (dispose: () => void): void => {
     disposers.push(dispose)
@@ -322,18 +326,16 @@ export function renderCharactersSection(options: {
 
   /** Give every rebuilt search box its focus and caret back. */
   const restoreSearchIntents = (root: HTMLElement): void => {
-    for (const [slot, intent] of searchIntents) {
-      if (!intent.focused) continue
-      const input = root.querySelector(`input[data-lt-search="${slot}"]`)
-      if (!(input instanceof HTMLInputElement)) continue
-      input.focus()
-      try {
-        const caret = Math.min(intent.caret, input.value.length)
-        input.setSelectionRange(caret, caret)
-      } catch {
-        // Some engines reject selection APIs on `type="search"`; focus alone
-        // keeps typing working.
-      }
+    if (!prevSlot) return
+    const input = root.querySelector(`input[data-lt-search="${prevSlot}"]`) as HTMLInputElement | null
+    if (!input) return
+    input.focus()
+    try {
+      const caret = Math.min(prevSelectionStart, input.value.length)
+      const end = Math.min(prevSelectionEnd, input.value.length)
+      input.setSelectionRange(caret, end)
+    } catch {
+      // Some engines reject selection APIs on `type="search"`; focus alone keeps typing working.
     }
   }
 
@@ -1075,6 +1077,12 @@ export function renderCharactersSection(options: {
         intent.caret = input.selectionStart ?? input.value.length
       }
     }
+
+    const prevInput = (document.activeElement as HTMLInputElement | null) || null
+    prevSlot = prevInput?.getAttribute('data-lt-search') || null
+    prevValue = prevInput ? prevInput.value : ''
+    prevSelectionStart = prevInput ? (prevInput.selectionStart ?? prevValue.length) : 0
+    prevSelectionEnd = prevInput ? (prevInput.selectionEnd ?? prevValue.length) : 0
 
     teardown()
     clear(container)
