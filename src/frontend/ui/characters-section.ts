@@ -161,6 +161,8 @@ const tagRowsExpanded = new Map<string, boolean>()
  * {@link pickerDefaultOpen}.
  */
 const pickerOpenState = new Map<string, boolean>()
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+let pickerTimer: ReturnType<typeof setTimeout> | null = null
 
 /**
  * Whether a tag picker with no remembered toggle starts open.
@@ -497,16 +499,12 @@ export function renderCharactersSection(options: {
       config.searchLabel,
       config.searchValue,
       (value) => {
-        // The picker's own text filter is pure view state: it is never a
-        // mutation, so it goes to module state and never touches the store.
-        pickerQueries.set(config.searchSlot, value)
-        // Typing is an explicit request to see the results, and the search box
-        // is only reachable while the disclosure is open — so without this a
-        // re-render could snap the block shut around the keystroke that was
-        // meant to filter it. A remembered "closed" would win over the default
-        // otherwise, since the reader did close it.
-        pickerOpenState.set(config.searchSlot, true)
-        render()
+        if (pickerTimer) clearTimeout(pickerTimer)
+        pickerTimer = setTimeout(() => {
+          pickerQueries.set(config.searchSlot, value)
+          pickerOpenState.set(config.searchSlot, true)
+          render()
+        }, 2000)
       },
     )
     body.appendChild(field('Find a tag', search))
@@ -1141,11 +1139,15 @@ export function renderCharactersSection(options: {
         if (slot === 'characters') input.value = view.characterQuery
         else input.value = pickerQueries.get(slot) ?? ''
         track(on(input, 'input', () => {
-          if (slot === 'characters') store.actions.setCharacterQuery(input.value)
-          else {
-            pickerQueries.set(slot, input.value)
-            pickerOpenState.set(slot, true)
-            render()
+          if (searchTimer) clearTimeout(searchTimer)
+          if (slot === 'characters') {
+            searchTimer = setTimeout(() => store.actions.setCharacterQuery(input.value), 2000)
+          } else {
+            pickerTimer = setTimeout(() => {
+              pickerQueries.set(slot, input.value)
+              pickerOpenState.set(slot, true)
+              render()
+            }, 2000)
           }
         }))
       }

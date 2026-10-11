@@ -75,6 +75,7 @@ const MODE_BUTTONS: readonly { mode: TagMode; label: string; title: string }[] =
  */
 let searchFocusIntent = false
 let searchCaret = 0
+let searchTimer: ReturnType<typeof setTimeout> | null = null
 
 /** Session-authenticated, read-only avatar endpoint for a character. */
 function avatarUrl(id: string): string {
@@ -753,7 +754,10 @@ export function renderTagsSection(options: {
     }) as HTMLInputElement
     search.value = view.tagQuery
     // Direct listener, not tracked — survives teardown()
-    search.addEventListener('input', () => store.actions.setTagQuery(search.value))
+    search.addEventListener('input', () => {
+      if (searchTimer) clearTimeout(searchTimer)
+      searchTimer = setTimeout(() => store.actions.setTagQuery(search.value), 2000)
+    })
     search.addEventListener('focus', () => { searchFocusIntent = true })
     search.addEventListener('blur', () => { searchFocusIntent = false })
     search.addEventListener('keyup', () => { searchCaret = search.selectionStart ?? search.value.length })
