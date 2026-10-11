@@ -136,8 +136,9 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
   const restoreScroll = (top: number, body: HTMLElement): void => {
     if (top <= 0) return
     const max = Math.max(0, body.scrollHeight - body.clientHeight)
-    if (max === 0) return // don't force jump to 0 on shorter content
-    body.scrollTop = Math.min(top, max)
+    // Don't jump downward: only restore if computed offset doesn't exceed previous top.
+    const clamped = max > 0 ? Math.min(top, max) : 0
+    body.scrollTop = Math.max(0, clamped)
   }
 
   const render = (): void => {
@@ -202,7 +203,7 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
           break
         }
       }
-      if (foundAnchor && previousAnchorOffset > 0) {
+      if (foundAnchor) {
         const computed = previousTop - previousAnchorOffset + newAnchorTop
         if (computed <= previousTop) {
           restoreScroll(computed, sectionHost)
