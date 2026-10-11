@@ -441,7 +441,11 @@ export class TagManagerStore {
     }
 
     this.state.characters = next
-    this.state.tagIndex = buildTagIndex(next)
+    // Diagnostic variant (priority 2): intentionally skip the expensive full
+    // tag-index rebuild after a successful write. This isolates whether index
+    // construction is the post-write crash point. The tag catalog will be stale
+    // until the extension is reloaded/refreshed; do not use this as a permanent
+    // build. Restore `buildTagIndex(next)` after the one-run diagnostic.
     this.pruneSelections()
   }
 
@@ -509,11 +513,7 @@ export class TagManagerStore {
     const report = await this.executor.execute(preview)
     await this.refresh(report.results.map((r) => r.characterId))
     if (this.disposed) return
-    // Diagnostic variant (priority 1): retain the report in store state but do
-    // not publish a new view snapshot or notify UI subscribers after the write.
-    // The refresh above still commits the refreshed characters/index. If this
-    // prevents the crash, investigate report-view computation/rendering next.
-    this.addReport(report, true, false)
+    this.addReport(report, true)
   }
 
   /**
@@ -522,7 +522,7 @@ export class TagManagerStore {
    * A fully successful operation is stored too: it is the user's confirmation
    * that the change actually landed.
    */
-  private addReport(report: OperationReport, activate: boolean, publish = true): void {
+  private addReport(report: OperationReport, activate: boolean): void {
     const existing = this.state.reports.findIndex((r) => r.opId === report.opId)
     if (existing >= 0) this.state.reports.splice(existing, 1)
     this.state.reports.push(report)
@@ -530,10 +530,7 @@ export class TagManagerStore {
       this.state.reports.splice(0, this.state.reports.length - REPORT_LIMIT)
     }
     if (activate) this.state.activeReportOpId = report.opId
-    // `publish=false` is used only by the priority-1 diagnostic build. The
-    // report remains in state, but it is not visible through `view` until a
-    // later store commit. Restore normal publication after the experiment.
-    if (publish) this.commit()
+    this.commit()
   }
 
   private async runRetry(
