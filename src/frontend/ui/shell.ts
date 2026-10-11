@@ -152,15 +152,18 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     // Read the offset off the PREVIOUS render's body, before `clear()` throws
     // that element away: the replacement starts life at 0 and there is no
     // browser-level memory of where the user was.
-    //
-    // A plain offset — not an anchor on the expanded row — is the right unit
-    // here, and deliberately so. The expanded character sub-list is inserted
-    // immediately AFTER its own row, so nothing above the row the user clicked
-    // changes height and preserving the raw offset leaves that row at exactly
-    // the pixel it was on. Anchoring would only add a second thing that can be
-    // computed wrongly (a stale `offsetTop` from the torn-down tree) to arrive
-    // at the same answer.
     const previousTop = sectionHost !== null ? sectionHost.scrollTop : 0
+    let previousAnchorOffset = 0
+    if (sectionHost !== null) {
+      const anchorSelectors = ['.lt-tag-row', '.lt-state', '.lt-box', '.lt-character-row']
+      for (const sel of anchorSelectors) {
+        const el = sectionHost.querySelector(sel) as HTMLElement | null
+        if (el) {
+          previousAnchorOffset = el.offsetTop - sectionHost.scrollTop
+          break
+        }
+      }
+    }
 
     // Switching tabs replaces the content wholesale with something unrelated,
     // so the offset from the previous tab is meaningless there and the new tab
@@ -187,7 +190,29 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
 
     // The body is populated and attached now, so `scrollHeight` is meaningful
     // and the clamp can be computed rather than guessed.
-    if (!switchedSection && sectionHost !== null) restoreScroll(previousTop, sectionHost)
+    if (!switchedSection && sectionHost !== null) {
+      const newAnchorSelectors = ['.lt-tag-row', '.lt-state', '.lt-box', '.lt-character-row']
+      let newAnchorTop = 0
+      let foundAnchor = false
+      for (const sel of newAnchorSelectors) {
+        const el = sectionHost.querySelector(sel) as HTMLElement | null
+        if (el) {
+          newAnchorTop = el.offsetTop
+          foundAnchor = true
+          break
+        }
+      }
+      if (foundAnchor && previousAnchorOffset > 0) {
+        const computed = previousTop - previousAnchorOffset + newAnchorTop
+        if (computed <= previousTop) {
+          restoreScroll(computed, sectionHost)
+        } else {
+          restoreScroll(previousTop, sectionHost)
+        }
+      } else {
+        restoreScroll(previousTop, sectionHost)
+      }
+    }
   }
 
   const renderHeader = (view: StoreView): HTMLElement => {
