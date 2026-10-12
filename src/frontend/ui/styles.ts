@@ -159,6 +159,34 @@ export const LUMITAG_CSS = `
   gap: 4px 6px;
 }
 
+.lt-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+  padding: 6px 2px;
+  font-size: 12px;
+  color: var(--lumiverse-text-muted);
+}
+
+.lt-pager__status {
+  font-variant-numeric: tabular-nums;
+}
+
+.lt-pager__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+.lt-pager__position {
+  padding: 0 4px;
+  font-variant-numeric: tabular-nums;
+  color: var(--lumiverse-text);
+}
+
 .lt-toolbar--busy {
   opacity: 0.85;
 }

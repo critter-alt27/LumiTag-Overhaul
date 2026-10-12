@@ -300,6 +300,12 @@ function makeView(overrides: Partial<StoreView> = {}): StoreView {
   }))
   return {
     section: 'tags',
+    tagPage: 0,
+    tagPageCount: 1,
+    tagPageRows: tagRows,
+    characterPage: 0,
+    characterPageCount: 1,
+    characterPageRows: [],
     loadState: 'ready',
     loadError: null,
     isRefreshing: false,

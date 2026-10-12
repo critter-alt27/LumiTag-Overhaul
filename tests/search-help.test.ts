@@ -3,7 +3,6 @@ import { describe, expect, test } from 'bun:test'
 import { SEARCHABLE_FIELDS } from '../src/shared/types'
 import {
   getSearchHelpSections,
-  SEARCHABLE_FIELD_LABELS,
   type SearchHelpSection,
 } from '../src/frontend/search/search-help'
 
@@ -33,7 +32,7 @@ describe('getSearchHelpSections', () => {
 
   test('every prefix appears in the tags context', () => {
     const entries = allEntries(getSearchHelpSections('tags'))
-    for (const prefix of ['T:', 'A:', 'C:']) {
+    for (const prefix of ['T:', 'C:']) {
       expect(
         entries.some((syntax) => syntax.includes(prefix)),
         `tags context should document ${prefix}`,
@@ -43,7 +42,7 @@ describe('getSearchHelpSections', () => {
 
   test('every prefix appears in the characters context', () => {
     const entries = allEntries(getSearchHelpSections('characters'))
-    for (const prefix of ['T:', 'A:', 'C:']) {
+    for (const prefix of ['T:', 'C:']) {
       expect(
         entries.some((syntax) => syntax.includes(prefix)),
         `characters context should document ${prefix}`,
@@ -69,10 +68,10 @@ describe('getSearchHelpSections', () => {
     }
   })
 
-  test('includes the four required worked examples in both contexts', () => {
+  test('includes the worked examples in both contexts', () => {
     for (const context of ['tags', 'characters'] as const) {
       const entries = allEntries(getSearchHelpSections(context))
-      for (const example of ['T:Elf T:Magic', 'T:Elf, T:Magic', 'A:John, T:Elf T:Magic', 'T:Elf -T:Dark']) {
+      for (const example of ['T:Elf T:Magic', 'T:Elf, T:Magic', 'C:John, T:Elf T:Magic', 'T:Elf -T:Dark']) {
         expect(entries, `${context} should show ${example}`).toContain(example)
       }
     }
@@ -89,12 +88,12 @@ describe('getSearchHelpSections', () => {
     expect(text).toContain('C: behaves the same as a plain name search')
   })
 
-  test('the tags context lists the exact A: searchable fields', () => {
-    const text = allText(getSearchHelpSections('tags'))
-    for (const field of SEARCHABLE_FIELDS) {
-      expect(text, `tags help should list A: field ${field}`).toContain(
-        SEARCHABLE_FIELD_LABELS[field],
-      )
+  test('no context documents A: any more', () => {
+    // A: was removed. Help text that still advertised it would teach a prefix
+    // that now silently means a plain name search.
+    for (const context of ['tags', 'characters'] as const) {
+      const text = allText(getSearchHelpSections(context))
+      expect(text, `${context} help`).not.toContain('A:')
     }
   })
 
@@ -111,19 +110,8 @@ describe('getSearchHelpSections', () => {
   })
 })
 
-describe('SEARCHABLE_FIELD_LABELS', () => {
-  test('keys match SEARCHABLE_FIELDS exactly, in both directions', () => {
-    const labelKeys = Object.keys(SEARCHABLE_FIELD_LABELS).sort()
-    const fieldKeys = [...SEARCHABLE_FIELDS].sort()
-    expect(labelKeys).toEqual(fieldKeys)
-    expect(labelKeys.length).toBe(fieldKeys.length)
-  })
-
-  test('every label is a non-empty human-readable string', () => {
-    for (const field of SEARCHABLE_FIELDS) {
-      const label = SEARCHABLE_FIELD_LABELS[field]
-      expect(typeof label).toBe('string')
-      expect(label.length).toBeGreaterThan(0)
-    }
+describe('SEARCHABLE_FIELDS', () => {
+  test('is name-only after A: was removed', () => {
+    expect([...SEARCHABLE_FIELDS]).toEqual(['name'])
   })
 })

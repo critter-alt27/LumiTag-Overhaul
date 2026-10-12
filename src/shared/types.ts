@@ -35,18 +35,15 @@ export interface CharacterTags {
 }
 
 /**
- * Fields exposed to the `A:` (any-field) search operator. This list is the
- * documented contract for `A:` — the UI help panel renders it verbatim, so
- * users always know exactly which fields a bare `A:` query can reach.
+ * Fields the search language can reach.
+ *
+ * Character NAME is the only one. The former `A:` operator also searched
+ * description / personality / scenario / creator / creator_notes, but a tag
+ * manager has little use for prose search, and carrying those fields across
+ * the message channel dominated memory on large libraries. `T:` and `C:` both
+ * match the name and/or tags only.
  */
-export const SEARCHABLE_FIELDS = [
-  'name',
-  'description',
-  'personality',
-  'scenario',
-  'creator',
-  'creator_notes',
-] as const
+export const SEARCHABLE_FIELDS = ['name'] as const
 export type SearchableField = (typeof SEARCHABLE_FIELDS)[number]
 
 /**

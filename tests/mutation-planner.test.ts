@@ -444,6 +444,103 @@ describe('planOperation — merge', () => {
   })
 })
 
+describe('planOperation — scoped remove (bulk unassign)', () => {
+  test('removes only from the selected characters, leaving unselected ones alone', () => {
+    const preview = planOperation(FIXTURE, {
+      op: 'remove',
+      tags: ['Elf'],
+      selectedIds: ['c1', 'c4'],
+    })
+
+    // The whole point of a scope: c3 and c5 also carry Elf, and they are NOT
+    // touched. A library-wide remove here would be a data-loss bug.
+    expect(preview.affectedCharacterIds).toEqual(['c1', 'c4'])
+    expect(targetFor(preview, 'c1')).toEqual(['Magic'])
+    expect(targetFor(preview, 'c4')).toEqual(['Dark', 'Rogue'])
+    // c3/c5 are outside the scope, so they are not even reported as skipped —
+    // "skipped" must mean "considered and left unchanged".
+    expect(preview.skipped.map((s) => s.characterId).sort()).toEqual([])
+  })
+
+  test('preserves the character other tags and never replaces the array', () => {
+    const preview = planOperation(FIXTURE, {
+      op: 'remove',
+      tags: ['Elf', 'Dark'],
+      selectedIds: ['c4'],
+    })
+
+    const mutation = mutationsFor(preview, 'c4')[0]!
+    expect(mutation.op).toBe('remove')
+    // One write per character, carrying BOTH removals in one record.
+    expect(mutationsFor(preview, 'c4')).toHaveLength(1)
+    expect(mutation.sourceTags).toEqual(['Dark', 'Elf'])
+    expect(mutation.removedTags).toEqual(['Dark', 'Elf'])
+    expect(mutation.addedTags).toEqual([])
+    expect(mutation.targetTags).toEqual(['Rogue'])
+    expect(mutation.beforeTags).toEqual(['Dark', 'Rogue', 'Elf'])
+    expect(mutation.intendedChange).toBe('Remove 2 tags ("Dark", "Elf") from Doran')
+  })
+
+  test('a selected character that lacks the tag is skipped, not written', () => {
+    const preview = planOperation(FIXTURE, {
+      op: 'remove',
+      tags: ['Elf'],
+      selectedIds: ['c2', 'c6'],
+    })
+
+    expect(preview.mutations).toHaveLength(0)
+    expect(preview.skipped.map((s) => s.characterId).sort()).toEqual(['c2', 'c6'])
+    expect(preview.skipped.every((s) => s.reason === 'tag not present')).toBe(true)
+    // "Nothing to change" is reported, never silently shown as a success.
+    expect(preview.changeCount).toBe(0)
+  })
+
+  test('a selected id that cannot be resolved is reported, never dropped', () => {
+    const preview = planOperation(FIXTURE, {
+      op: 'remove',
+      tags: ['Elf'],
+      selectedIds: ['c1', 'ghost'],
+    })
+
+    expect(mutationsFor(preview, 'c1')).toHaveLength(1)
+    expect(preview.skipped).toEqual([
+      { characterId: 'ghost', characterName: '', reason: 'character not found' },
+    ])
+  })
+
+  test('an empty selection writes nothing at all', () => {
+    const preview = planOperation(FIXTURE, { op: 'remove', tags: ['Elf'], selectedIds: [] })
+
+    expect(preview.mutations).toHaveLength(0)
+    expect(preview.skipped).toEqual([])
+    expect(preview.affectedCharacterCount).toBe(0)
+  })
+
+  test('the label marks the operation as scoped, so a report cannot read library-wide', () => {
+    const scoped = planOperation(FIXTURE, { op: 'remove', tags: ['Elf'], selectedIds: ['c1'] })
+    expect(scoped.label).toBe('Remove tag: Elf from selection')
+
+    const multi = planOperation(FIXTURE, {
+      op: 'remove',
+      tags: ['Elf', 'Dark'],
+      selectedIds: ['c1'],
+    })
+    expect(multi.label).toBe('Remove 2 tags from selection')
+  })
+
+  test('omitting selectedIds keeps the library-wide remove contract intact', () => {
+    const preview = planOperation(FIXTURE, { op: 'remove', tags: ['Elf'] })
+
+    // The scope is opt-in, so an unscoped remove still reaches EVERY character
+    // carrying the tag — identical reach to `delete`, differing only in wording.
+    const asDelete = planOperation(FIXTURE, { op: 'delete', tags: ['Elf'] })
+    expect(preview.affectedCharacterIds).toEqual(asDelete.affectedCharacterIds)
+    // Sorted by name then id, so the two characters named "Cira" sit together.
+    expect(preview.affectedCharacterIds).toEqual(['c1', 'c3', 'c5', 'c4'])
+    expect(preview.label).toBe('Remove tag: Elf')
+  })
+})
+
 describe('one mutation per character', () => {
   /** `count` characters, each carrying ALL of `tags`. */
   function bulk(count: number, tags: string[]): LumiTagCharacter[] {

@@ -50,6 +50,7 @@ export type DialogRequest =
   | { kind: 'merge_review' }
   | { kind: 'delete_tags'; tags: string[] }
   | { kind: 'bulk_assign_review' }
+  | { kind: 'bulk_unassign_review' }
   | { kind: 'search_help'; context: 'tags' | 'characters' }
 
 export interface ShellOptions {

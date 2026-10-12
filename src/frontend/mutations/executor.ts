@@ -534,12 +534,9 @@ export class MutationExecutor {
     report: OperationReport,
     mutationIds: readonly string[],
   ): Promise<OperationReport> {
-    // `touch`, not `get`: a retry the user just asked for is the strongest
-    // signal that this report is still wanted, so it must refresh recency
-    // before the writes below can push it out of the window. The caller's own
-    // report is the fallback precisely so an evicted entry can never leave a
-    // retry operating on nothing.
-    const base = this.touch(report.opId) ?? report
+    // The caller's report IS the source of truth: the executor keeps no
+    // retention cache of past reports, so there is nothing else to consult.
+    const base = report
     const working: OperationReport = {
       ...base,
       results: cloneResults(base.results),

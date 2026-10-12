@@ -368,3 +368,100 @@ export function sectionEl(cls: string, children?: (Node | string | null | undefi
 export function row(...children: (Node | string | null | undefined)[]): HTMLElement {
   return el('div', { class: 'lt-row' }, children)
 }
+
+/**
+ * Page controls for a paged list.
+ *
+ * Returns `null` when everything fits on one page — an inert pager is worse
+ * than none, because it reads as a control that does nothing.
+ *
+ * The range line ("showing 1–300 of 5,000") is always present when a pager is,
+ * so the reader can tell the difference between "that is all of them" and
+ * "that is this page" without counting rows.
+ */
+export function pager(options: {
+  page: number
+  pageCount: number
+  total: number
+  pageSize: number
+  onPage: (page: number) => void
+  /** Noun for the `aria-label`s, e.g. 'characters'. */
+  label: string
+}): HTMLElement | null {
+  const { page, pageCount, total, pageSize, onPage, label } = options
+  if (pageCount <= 1) return null
+
+  const safePage = clampIndex(page, pageCount)
+  const first = safePage * pageSize + 1
+  const last = Math.min((safePage + 1) * pageSize, total)
+
+  const wrap = el('div', {
+    class: 'lt-pager',
+    role: 'group',
+    'aria-label': `${label} pagination`,
+  })
+
+  wrap.appendChild(
+    el('span', { class: 'lt-pager__status' }, [
+      `Showing ${first}–${last} of ${total} ${label}`,
+    ]),
+  )
+
+  const actions = el('div', { class: 'lt-pager__actions' })
+
+  const firstBtn = button('First', {
+    variant: 'ghost',
+    title: `Go to the first page of ${label}`,
+    ariaLabel: `First page of ${label}`,
+    onClick: () => onPage(0),
+  })
+  setDisabled(firstBtn, safePage === 0)
+  actions.appendChild(firstBtn)
+
+  const prev = button('Previous', {
+    variant: 'ghost',
+    title: `Previous page of ${label}`,
+    ariaLabel: `Previous page of ${label}`,
+    onClick: () => onPage(safePage - 1),
+  })
+  setDisabled(prev, safePage === 0)
+  actions.appendChild(prev)
+
+  // `aria-live` so the page change is announced: the status text is the only
+  // thing that tells a screen-reader user the list moved.
+  actions.appendChild(
+    el('span', { class: 'lt-pager__position', 'aria-live': 'polite' }, [
+      `Page ${safePage + 1} of ${pageCount}`,
+    ]),
+  )
+
+  const next = button('Next', {
+    variant: 'ghost',
+    title: `Next page of ${label}`,
+    ariaLabel: `Next page of ${label}`,
+    onClick: () => onPage(safePage + 1),
+  })
+  setDisabled(next, safePage >= pageCount - 1)
+  actions.appendChild(next)
+
+  const lastBtn = button('Last', {
+    variant: 'ghost',
+    title: `Go to the last page of ${label}`,
+    ariaLabel: `Last page of ${label}`,
+    onClick: () => onPage(pageCount - 1),
+  })
+  setDisabled(lastBtn, safePage >= pageCount - 1)
+  actions.appendChild(lastBtn)
+
+  wrap.appendChild(actions)
+  return wrap
+}
+
+/** Clamp a page index into `[0, pageCount)`, treating junk as page 0. */
+function clampIndex(page: number, pageCount: number): number {
+  if (!Number.isFinite(page)) return 0
+  const floored = Math.floor(page)
+  if (floored < 0) return 0
+  if (floored > pageCount - 1) return pageCount - 1
+  return floored
+}

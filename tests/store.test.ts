@@ -4,7 +4,12 @@ import { classifyError, MutationExecutor } from '../src/frontend/mutations/execu
 import type { CharacterRepository } from '../src/frontend/repository'
 import type { BatchFailure } from '../src/shared/protocol'
 import {
+  CHARACTER_PAGE_SIZE,
+  TAG_PAGE_SIZE,
   TagManagerStore,
+  clampPage,
+  pageCountFor,
+  pageSlice,
   type CharacterSortMode,
   type CharacterTagFilter,
 } from '../src/frontend/store'
@@ -389,13 +394,20 @@ describe('store character query and sorting', () => {
     expect(names(store.view)).toEqual([])
   })
 
-  test('A: searches the documented fields', async () => {
+  test('prose fields are unreachable now that A: is gone', async () => {
     const fake = seeded()
     fake.server.get('c1')!.description = 'A wandering herbalist'
     const store = makeStore(fake)
     await store.load()
 
+    // `A:` was removed, so no operator reaches `description` any more. A retired
+    // `A:` term degrades to a NAME search and finds nothing.
     store.actions.setCharacterQuery('A:herbalist')
+    expect(names(store.view)).toEqual([])
+    store.actions.setCharacterQuery('herbalist')
+    expect(names(store.view)).toEqual([])
+    // The name itself still matches.
+    store.actions.setCharacterQuery('aria')
     expect(names(store.view)).toEqual(['Aria'])
   })
 
@@ -872,6 +884,399 @@ describe('store.runBulkAssign', () => {
     expect(fake.server.get('c2')?.tags).toEqual(['Elf', 'Magic'])
     expect(store.view.tagIndex.byKey.has('dark')).toBe(false)
     expect(store.view.reports.at(-1)?.op).toBe('merge')
+  })
+})
+
+describe('store.runBulkUnassign', () => {
+  test('removes the tags only from the selected characters', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runBulkUnassign(['Elf'], ['c1'])
+
+    // `c1` loses Elf and keeps everything else — the array is never replaced.
+    expect(fake.server.get('c1')?.tags).toEqual(['Magic', 'Knight'])
+    // The scope is the whole safety story here: `c2` also carries Elf and was
+    // NOT selected, so it must be untouched.
+    expect(fake.server.get('c2')?.tags).toEqual(['Elf', 'Dark'])
+
+    const row = store.view.characterRows.find((r) => r.character.id === 'c1')
+    expect(row?.tags).toEqual(['Magic', 'Knight'])
+    expect(store.view.tagIndex.byKey.get('elf')?.count).toBe(1)
+  })
+
+  test('a selected character that lacks the tag is not written', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    const writesBefore = fake.batchWrites.length
+    await store.actions.runBulkUnassign(['Elf'], ['c3', 'c4'])
+
+    // `c3` has Magic only and `c4` has no tags: neither is a no-op write, so
+    // this operation must produce NO write at all.
+    expect(fake.batchWrites.length).toBe(writesBefore)
+    expect(fake.server.get('c3')?.tags).toEqual(['Magic'])
+    expect(fake.server.get('c4')?.tags).toEqual([])
+    expect(store.view.reports.at(-1)?.status).toBe('succeeded')
+  })
+
+  test('removes several tags at once from one character', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runBulkUnassign(['Elf', 'Magic'], ['c1'])
+
+    expect(fake.server.get('c1')?.tags).toEqual(['Knight'])
+  })
+
+  test('is subtractive and non-destructive: unrelated tags survive', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    // Case-insensitive match, and the original spelling/order of what remains.
+    await store.actions.runBulkUnassign(['elf'], ['c2'])
+
+    expect(fake.server.get('c2')?.tags).toEqual(['Dark'])
+  })
+
+  test('an empty tag list or an empty selection writes nothing', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    const writesBefore = fake.batchWrites.length
+    const reportsBefore = store.view.reports.length
+
+    await store.actions.runBulkUnassign([], ['c1'])
+    await store.actions.runBulkUnassign(['Elf'], [])
+
+    expect(fake.batchWrites.length).toBe(writesBefore)
+    expect(store.view.reports.length).toBe(reportsBefore)
+    expect(fake.server.get('c1')?.tags).toEqual(['Elf', 'Magic', 'Knight'])
+  })
+
+  test('costs ONE batched write and ONE batched read, like any bulk edit', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    fake.batchWrites.length = 0
+    fake.batchGets.length = 0
+    await store.actions.runBulkUnassign(['Elf'], ['c1', 'c2'])
+
+    expect(fake.batchWrites).toHaveLength(1)
+    expect(fake.batchWrites[0]?.map((w) => w.characterId).sort()).toEqual(['c1', 'c2'])
+    expect(fake.batchGets).toHaveLength(1)
+  })
+
+  test('a partial failure is reported per character and retryable per character', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    fake.failWrites('c2', new Error('network unreachable'), 1)
+    await store.actions.runBulkUnassign(['Elf'], ['c1', 'c2'])
+
+    const report = store.view.reports.at(-1)
+    expect(report?.op).toBe('remove')
+    // A label that reads as library-wide would misreport what was attempted.
+    expect(report?.label).toBe('Remove tag: Elf from selection')
+    expect(report?.status).toBe('partially_completed')
+    // The successful write is saved; the failed one keeps its tag.
+    expect(fake.server.get('c1')?.tags).toEqual(['Magic', 'Knight'])
+    expect(fake.server.get('c2')?.tags).toEqual(['Elf', 'Dark'])
+    expect(report?.totals.succeeded).toBe(1)
+    expect(report?.totals.failed).toBe(1)
+    expect(report?.totals.remaining).toBe(1)
+    // The character that succeeded is still reported as resolved, so a retry
+    // can never re-remove from it.
+    expect(report?.results.filter((r) => r.state === 'succeeded')).toHaveLength(1)
+    // The catalog is rebuilt from the confirmed read: Elf survives on exactly
+    // the one character whose write failed.
+    expect(store.view.tagIndex.byKey.get('elf')?.count).toBe(1)
+
+    // The failure is recoverable: retrying recovers it without re-writing the
+    // character that already succeeded.
+    const failed = report?.results.find((r) => r.state === 'failed')
+    expect(failed).toBeDefined()
+    await store.actions.retryOne(report!.opId, failed!.mutationId)
+
+    expect(fake.server.get('c2')?.tags).toEqual(['Dark'])
+    // `c1` was resolved on the first attempt and is NOT rewritten by the retry.
+    expect(fake.server.get('c1')?.tags).toEqual(['Magic', 'Knight'])
+    expect(store.view.reports.at(-1)?.status).toBe('succeeded')
+    expect(store.view.tagIndex.byKey.has('elf')).toBe(false)
+  })
+
+  test('unassigning the last tag leaves an untagged character, not a broken one', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runBulkUnassign(['Elf', 'Dark'], ['c2'])
+
+    expect(fake.server.get('c2')?.tags).toEqual([])
+    // `Dark` existed only on `c2`, so it leaves the derived catalog entirely
+    // rather than lingering as a zero-count entry. `Elf` stays: `c1` still
+    // carries it, which is the point of a scoped removal.
+    expect(store.view.tagIndex.byKey.has('dark')).toBe(false)
+    expect(store.view.tagIndex.byKey.get('elf')?.count).toBe(1)
+    expect(store.view.untaggedCount).toBe(2) // c2 and the already-empty c4
+  })
+})
+
+describe('view paging', () => {
+  /** `count` characters named `Char 0001`… so sort order is stable. */
+  function manyCharacters(count: number): FakeRepository {
+    const fake = new FakeRepository()
+    for (let i = 1; i <= count; i += 1) {
+      fake.seed(`c${i}`, `Char ${String(i).padStart(5, '0')}`, ['Elf', 'Magic'])
+    }
+    return fake
+  }
+
+  const pageSize = CHARACTER_PAGE_SIZE
+
+  test('a list that fits on one page is a single page', async () => {
+    const store = makeStore(manyCharacters(10))
+    await store.load()
+
+    expect(store.view.characterPageCount).toBe(1)
+    expect(store.view.characterPageRows).toHaveLength(10)
+  })
+
+  test('rows beyond the first page are reachable by paging', async () => {
+    const total = pageSize + 25
+    const store = makeStore(manyCharacters(total))
+    await store.load()
+
+    expect(store.view.characterPageCount).toBe(2)
+    expect(store.view.characterPageRows).toHaveLength(pageSize)
+
+    store.actions.setCharacterPage(1)
+    expect(store.view.characterPageRows).toHaveLength(25)
+    // The last row of the last page is reachable — that is the whole point.
+    expect(store.view.characterPageRows.at(-1)?.character.id).toBe(`c${total}`)
+    // The FULL list is still intact behind the window.
+    expect(store.view.characterRows).toHaveLength(total)
+  })
+
+  test('selection made on page 1 survives turning to page 2 and back', async () => {
+    const total = pageSize + 25
+    const store = makeStore(manyCharacters(total))
+    await store.load()
+
+    const firstPageId = store.view.characterPageRows[0]!.character.id
+    store.actions.toggleCharacterSelected(firstPageId, true)
+
+    // Move to page 2 and tick something there too.
+    store.actions.setCharacterPage(1)
+    const secondPageId = store.view.characterPageRows[0]!.character.id
+    store.actions.toggleCharacterSelected(secondPageId, true)
+
+    store.actions.setCharacterPage(1)
+    // The off-page selection is retained, not dropped by the page change.
+    expect(store.view.selectedCharacterIds.sort()).toEqual([firstPageId, secondPageId].sort())
+    // ...and the row on THIS page renders ticked.
+    expect(store.view.characterPageRows.find((r) => r.character.id === secondPageId)?.selected).toBe(
+      true,
+    )
+
+    store.actions.setCharacterPage(0)
+    expect(store.view.selectedCharacterIds.sort()).toEqual([firstPageId, secondPageId].sort())
+    expect(store.view.characterPageRows.find((r) => r.character.id === firstPageId)?.selected).toBe(
+      true,
+    )
+  })
+
+  test('Select All selects every match across every page', async () => {
+    const total = pageSize + 25
+    const store = makeStore(manyCharacters(total))
+    await store.load()
+
+    store.actions.selectAllVisibleCharacters()
+
+    // Every MATCH, not just the rendered page — this is what the button's
+    // tooltip promises.
+    expect(store.view.selectedCharacterIds).toHaveLength(total)
+
+    store.actions.setCharacterPage(1)
+    expect(store.view.selectedCharacterIds).toHaveLength(total)
+  })
+
+  test('a bulk operation acts on the whole cross-page selection', async () => {
+    const fake = manyCharacters(pageSize + 25)
+    // Give the FIRST character an extra tag before load, so the store's own
+    // copy sees it. Mutating the fake afterwards would be too late: the planner
+    // reads the loaded state, not the fake.
+    fake.seed('c1', 'Char 00001', ['Elf', 'Magic', 'Rogue'])
+    const store = makeStore(fake)
+    await store.load()
+
+    const firstId = store.view.characterRows[0]!.character.id
+    // Select one character on page 1 and one on page 2.
+    store.actions.toggleCharacterSelected(firstId, true)
+    store.actions.setCharacterPage(1)
+    const secondId = store.view.characterPageRows[0]!.character.id
+    store.actions.toggleCharacterSelected(secondId, true)
+    const selected = [...store.view.selectedCharacterIds]
+    expect(selected).toHaveLength(2)
+
+    await store.actions.runBulkUnassign(['Rogue'], selected)
+
+    // The page-1 character loses it even though page 2 is on screen: the
+    // operation covers the whole selection, not the rendered rows.
+    expect(fake.server.get(firstId)?.tags).toEqual(['Elf', 'Magic'])
+  })
+
+  test('a new query, sort or filter returns to page 1', async () => {
+    const store = makeStore(manyCharacters(pageSize + 25))
+    await store.load()
+
+    store.actions.setCharacterPage(1)
+    expect(store.view.characterPage).toBe(1)
+
+    store.actions.setCharacterSort('name_zdesc')
+    expect(store.view.characterPage).toBe(0)
+
+    store.actions.setCharacterPage(1)
+    store.actions.setCharacterTagFilter('has_tags')
+    expect(store.view.characterPage).toBe(0)
+
+    store.actions.setCharacterPage(1)
+    store.actions.setCharacterQuery('elf')
+    expect(store.view.characterPage).toBe(0)
+  })
+
+  test('a page stranded past the end is clamped instead of rendering empty', async () => {
+    const store = makeStore(manyCharacters(pageSize + 25))
+    await store.load()
+
+    store.actions.setCharacterPage(1)
+    // A filter that collapses the list to a single page must not leave the
+    // reader stranded on a page that no longer exists.
+    store.actions.setCharacterQuery('Char 00001')
+    expect(store.view.characterPageCount).toBe(1)
+    expect(store.view.characterPage).toBe(0)
+    expect(store.view.characterPageRows).toHaveLength(1)
+  })
+
+  test('an empty list is page 1 of 1, not page 1 of 0', async () => {
+    const store = makeStore(manyCharacters(10))
+    await store.load()
+
+    store.actions.setCharacterQuery('nothing-matches-this')
+    expect(store.view.characterRows).toHaveLength(0)
+    expect(store.view.characterPageCount).toBe(1)
+    expect(store.view.characterPage).toBe(0)
+    expect(store.view.characterPageRows).toHaveLength(0)
+  })
+
+  test('the tags list pages the same way', async () => {
+    const fake = new FakeRepository()
+    // Distinct tag per character, so the catalog is larger than one page.
+    for (let i = 1; i <= TAG_PAGE_SIZE + 30; i += 1) {
+      fake.seed(`c${i}`, `Char ${i}`, [`tag-${String(i).padStart(5, '0')}`])
+    }
+    const store = makeStore(fake)
+    await store.load()
+
+    expect(store.view.tagRows).toHaveLength(TAG_PAGE_SIZE + 30)
+    expect(store.view.tagPageCount).toBe(2)
+    expect(store.view.tagPageRows).toHaveLength(TAG_PAGE_SIZE)
+
+    store.actions.setTagPage(1)
+    expect(store.view.tagPageRows).toHaveLength(30)
+  })
+
+  test('tags selected on one page stay selected on another', async () => {
+    const fake = new FakeRepository()
+    for (let i = 1; i <= TAG_PAGE_SIZE + 30; i += 1) {
+      fake.seed(`c${i}`, `Char ${i}`, [`tag-${String(i).padStart(5, '0')}`])
+    }
+    const store = makeStore(fake)
+    await store.load()
+
+    store.actions.setTagMode('bulk_delete')
+    const firstPageKey = store.view.tagPageRows[0]!.entry.key
+
+    store.actions.toggleTagSelected(firstPageKey, true)
+
+    // Move to page 2 and tick a tag there too.
+    store.actions.setTagPage(1)
+    const secondPageKey = store.view.tagPageRows[0]!.entry.key
+    store.actions.toggleTagSelected(secondPageKey, true)
+
+    store.actions.setTagPage(0)
+    expect(store.view.selectedTagCount).toBe(2)
+    expect(store.view.selectedTagKeys).toContain(secondPageKey)
+
+    store.actions.setTagPage(1)
+    expect(store.view.selectedTagCount).toBe(2)
+    expect(store.view.tagPageRows.find((r) => r.selected)?.entry.key).toBe(secondPageKey)
+  })
+
+  test('Select All in the tags section selects every match across pages', async () => {
+    const fake = new FakeRepository()
+    for (let i = 1; i <= TAG_PAGE_SIZE + 30; i += 1) {
+      fake.seed(`c${i}`, `Char ${i}`, [`tag-${String(i).padStart(5, '0')}`])
+    }
+    const store = makeStore(fake)
+    await store.load()
+
+    store.actions.setTagMode('bulk_delete')
+    store.actions.selectAllVisibleTags()
+    expect(store.view.selectedTagCount).toBe(TAG_PAGE_SIZE + 30)
+  })
+
+  test('changing the tag query or sort returns to page 1', async () => {
+    const fake = new FakeRepository()
+    for (let i = 1; i <= TAG_PAGE_SIZE + 30; i += 1) {
+      fake.seed(`c${i}`, `Char ${i}`, [`tag-${String(i).padStart(5, '0')}`])
+    }
+    const store = makeStore(fake)
+    await store.load()
+
+    store.actions.setTagPage(1)
+    store.actions.setTagSort('count_desc')
+    expect(store.view.tagPage).toBe(0)
+
+    store.actions.setTagPage(1)
+    store.actions.setTagQuery('tag-000')
+    expect(store.view.tagPage).toBe(0)
+  })
+})
+
+describe('clampPage / pageCountFor / pageSlice', () => {
+  test('pageCountFor rounds up and never returns zero', () => {
+    expect(pageCountFor(0, 10)).toBe(1)
+    expect(pageCountFor(1, 10)).toBe(1)
+    expect(pageCountFor(10, 10)).toBe(1)
+    expect(pageCountFor(11, 10)).toBe(2)
+    expect(pageCountFor(0, 0)).toBe(1)
+  })
+
+  test('clampPage keeps the page inside range', () => {
+    expect(clampPage(-5, 3)).toBe(0)
+    expect(clampPage(0, 3)).toBe(0)
+    expect(clampPage(2, 3)).toBe(2)
+    expect(clampPage(99, 3)).toBe(2)
+    expect(clampPage(Number.NaN, 3)).toBe(0)
+  })
+
+  test('clampPage of an empty list is page 0, not a negative index', () => {
+    expect(clampPage(7, 0)).toBe(0)
+    expect(clampPage(-7, 0)).toBe(0)
+  })
+
+  test('pageSlice takes the window and never runs past the end', () => {
+    expect(pageSlice([1, 2, 3, 4, 5], 0, 2)).toEqual([1, 2])
+    expect(pageSlice([1, 2, 3, 4, 5], 2, 2)).toEqual([5])
+    expect(pageSlice([1, 2, 3, 4, 5], 9, 2)).toEqual([])
   })
 })
 
