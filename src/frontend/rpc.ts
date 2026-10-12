@@ -13,6 +13,9 @@ type SpindleRpcContext = Pick<
 >
 
 const DEFAULT_TIMEOUT_MS = 20_000
+const MAX_TIMEOUT_MS = 120_000
+const BATCH_TIMEOUT_MS_PER_CARD = 75
+const CANCEL_GRACE_MS = 15_000
 
 const ERROR_PROTOCOL = 'protocol_error'
 const ERROR_DISPOSED = 'disposed'
@@ -135,7 +138,8 @@ function isWellFormedFor(response: Record<string, unknown>, expectedType: Backen
  *
  * Responsibilities:
  *  - mint unique request ids and correlate replies
- *  - enforce a per-request deadline (default 20s) that rejects as RETRYABLE
+ *  - enforce request deadlines (batch writes scale to a 120s cap) and request
+ *    cooperative backend cancellation when a batch deadline expires
  *  - unwrap `{ type: 'error' }` replies into thrown `SpindleRpcError`s
  *  - guarantee no listener or timer survives a settled request or `dispose()`
  */
@@ -190,17 +194,35 @@ export class SpindleRpc {
         expectedType,
       }
 
+      const requestTimeoutMs = this.timeoutFor(req)
       entry.timer = setTimeout(() => {
-        // Drop the entry first so the timeout is the single settle point.
+        if (req.type === 'characters.updateTagsBatch') {
+          // Arm the grace timer before sending: test transports may reply
+          // synchronously, and settle() must be able to clear this timer.
+          entry.timer = setTimeout(() => {
+            this.pending.delete(requestId)
+            reject(new SpindleRpcError(
+              BACKEND_ERROR_TIMEOUT,
+              `LumiTag backend request '${req.type}' exceeded ${requestTimeoutMs}ms; cancellation was requested but no final status arrived`,
+              true,
+            ))
+          }, CANCEL_GRACE_MS)
+          // Keep the request pending while the backend stops between cards and
+          // returns the exact cards that were not started before the deadline.
+          try {
+            this.ctx.sendToBackend({ type: 'characters.updateTagsBatch.cancel', requestId })
+          } catch {
+            // The grace timer reports an uncertain timeout if cancellation fails.
+          }
+          return
+        }
         this.pending.delete(requestId)
-        reject(
-          new SpindleRpcError(
-            BACKEND_ERROR_TIMEOUT,
-            `LumiTag backend request '${req.type}' timed out after ${this.timeoutMs}ms`,
-            true,
-          ),
-        )
-      }, this.timeoutMs)
+        reject(new SpindleRpcError(
+          BACKEND_ERROR_TIMEOUT,
+          `LumiTag backend request '${req.type}' timed out after ${requestTimeoutMs}ms`,
+          true,
+        ))
+      }, requestTimeoutMs)
 
       this.pending.set(requestId, entry)
 
@@ -287,6 +309,16 @@ export class SpindleRpc {
     }
 
     entry.resolve(payload as unknown as BackendResponse)
+  }
+
+  private timeoutFor(req: BackendRequestInit): number {
+    if (req.type === 'characters.updateTagsBatch') {
+      // Explicit timeout overrides remain useful for tests and embedding apps.
+      if (this.timeoutMs !== DEFAULT_TIMEOUT_MS) return this.timeoutMs
+      // Keep small requests snappy, scale larger batches, and cap at two minutes.
+      return Math.min(MAX_TIMEOUT_MS, Math.max(DEFAULT_TIMEOUT_MS, req.updates.length * BATCH_TIMEOUT_MS_PER_CARD))
+    }
+    return this.timeoutMs
   }
 
   /** Removes the pending entry and clears its timer exactly once. */

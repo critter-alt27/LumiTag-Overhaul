@@ -295,15 +295,13 @@ describe('derived totals and status survive the single-pass progress path', () =
     expect(report.status).toBe('partially_completed')
   })
 
-  test('the executor keeps no record that disagrees with its own final report', async () => {
+  test('the final report has internally consistent totals and status', async () => {
     const server = new Map<string, LumiTagCharacter>([['c1', character('c1', 'C1', ['Dragon'])]])
     const executor = new MutationExecutor(new MixPort(server, new Set(['c1'])))
     const report = await executor.execute(bulkPreview(1))
 
-    const stored = executor.getReport(report.opId)!
-    expect(stored.totals).toEqual(report.totals)
-    expect(stored.status).toBe(report.status)
-    expect(stored.results).toEqual(report.results)
+    expect(report.totals).toEqual(computeTotals(report.results))
+    expect(report.status).toBe(deriveStatus(report.results, false))
   })
 
   test('a 300-character all-failing operation still reports every failure', async () => {

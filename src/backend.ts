@@ -38,6 +38,10 @@ declare const spindle: import('lumiverse-spindle-types').SpindleAPI
 const ERROR_INVALID_INPUT = 'invalid_input'
 const ERROR_FORBIDDEN = 'forbidden'
 const ERROR_INTERNAL = 'internal'
+const ERROR_BATCH_CANCELLED = 'batch_cancelled'
+
+// Cancellation is cooperative: an in-flight host update settles, but no later card starts.
+const cancelledTagBatches = new Set<string>()
 
 /**
  * The host could not resolve which user an operator-scoped character call
@@ -348,9 +352,22 @@ async function handleUpdateTagsBatch(payload: Record<string, unknown>, userId: s
   }
 
   const updated: { id: string; tags: string[] }[] = []
-  for (const update of updates) {
-    try {
-      const character = await spindle.characters.update(update.characterId, { tags: update.tags }, scopedUserId)
+  try {
+    for (let index = 0; index < updates.length; index += 1) {
+      const update = updates[index]!
+      if (cancelledTagBatches.has(requestId)) {
+        for (const unfinished of updates.slice(index)) {
+          failures.push({
+            characterId: unfinished.characterId,
+            code: ERROR_BATCH_CANCELLED,
+            message: 'Not processed: the batch deadline was reached before this card started',
+            retryable: true,
+          })
+        }
+        break
+      }
+      try {
+        const character = await spindle.characters.update(update.characterId, { tags: update.tags }, scopedUserId)
       // The `id` here is a CORRELATION KEY, not the host's echo of itself: the
       // frontend matches each `updated` entry back to the character it asked to
       // write, and anything that fails to match is reported as an unknown
@@ -359,10 +376,13 @@ async function handleUpdateTagsBatch(payload: Record<string, unknown>, userId: s
       // verification while still looking like a clean reply. `update.characterId`
       // is the id we validated above and handed to the host, so it is the only
       // id in this function that is guaranteed to be ours.
-      updated.push({ id: update.characterId, tags: normalizeCharacterTagsOnly(character).tags })
-    } catch (err) {
-      failures.push({ characterId: update.characterId, ...classifyError(err) })
+        updated.push({ id: update.characterId, tags: normalizeCharacterTagsOnly(character).tags })
+      } catch (err) {
+        failures.push({ characterId: update.characterId, ...classifyError(err) })
+      }
     }
+  } finally {
+    cancelledTagBatches.delete(requestId)
   }
 
   spindle.sendToFrontend(
@@ -440,6 +460,11 @@ spindle.onFrontendMessage((payload: unknown, userId: string) => {
     case 'characters.updateTagsBatch':
       void handleUpdateTagsBatch(payload, userId)
       return
+    case 'characters.updateTagsBatch.cancel': {
+      const requestId = recoverRequestId(payload)
+      if (requestId) cancelledTagBatches.add(requestId)
+      return
+    }
     case 'characters.getBatch':
       void handleGetBatch(payload, userId)
       return
