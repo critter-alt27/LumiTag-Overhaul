@@ -120,7 +120,13 @@ export interface OperationPreview {
 export type PlanInput =
   | { op: 'assign'; tag: string; selectedIds: readonly string[] }
   | { op: 'assign'; tags: readonly string[]; selectedIds: readonly string[] }
-  | { op: 'remove'; tags: readonly string[] }
+  /**
+   * Removal is library-wide by default. When `selectedIds` is supplied the
+   * removal is SCOPED: only those characters are considered, and a selected id
+   * that cannot be resolved is reported in `skipped` rather than silently
+   * dropped. Omitting `selectedIds` is the original, whole-library behaviour.
+   */
+  | { op: 'remove'; tags: readonly string[]; selectedIds?: readonly string[] }
   | { op: 'rename'; from: string; to: string }
   | { op: 'merge'; primary: string; targets: readonly string[] }
   | { op: 'delete'; tags: readonly string[] }
@@ -414,13 +420,39 @@ function planRemoval(
   op: 'remove' | 'delete',
   characters: readonly LumiTagCharacter[],
   removeTags: string[],
+  selectedIds?: readonly string[],
 ): OperationPreview {
   const mutations: PlannedMutation[] = []
   const skipped: SkippedMutation[] = []
 
   const removeKeys = new Set(removeTags.map((tag) => tagKey(tag)))
 
-  for (const character of characters) {
+  // A scope restricts WHICH characters are examined; it never filters `characters`
+  // beyond membership. `undefined` (delete) keeps the library-wide contract.
+  const scopedIds = Array.isArray(selectedIds) ? selectedIds : null
+  const scope = scopedIds === null ? null : new Set(scopedIds)
+
+  // A scoped removal walks the selection in the caller's order and resolves each
+  // id, so a selection referring to a character we cannot read is REPORTED
+  // instead of quietly narrowing the operation.
+  const scoped: LumiTagCharacter[] = []
+  if (scopedIds !== null) {
+    const byId = new Map<string, LumiTagCharacter>()
+    for (const character of characters) {
+      if (!character || typeof character !== 'object') continue
+      const id = idOf(character)
+      if (id !== '') byId.set(id, character)
+    }
+    for (const rawId of scopedIds) {
+      if (typeof rawId !== 'string') continue
+      const id = rawId.trim()
+      const character = byId.get(id)
+      if (character) scoped.push(character)
+      else skipped.push({ characterId: id, characterName: '', reason: 'character not found' })
+    }
+  }
+
+  for (const character of scope === null ? characters : scoped) {
     if (!character || typeof character !== 'object') continue
     const ctx: Ctx = {
       opId,
@@ -470,10 +502,14 @@ function planRemoval(
     })
   }
 
+  const verb = op === 'delete' ? 'Delete' : 'Remove'
+  // A scoped removal says so in its label: the report panel must never show a
+  // selection-scoped operation under a label that reads as library-wide.
+  const scopeNote = scope === null ? '' : ' from selection'
   const label =
     removeTags.length === 1
-      ? `${op === 'delete' ? 'Delete tag' : 'Remove tag'}: ${safe(removeTags[0])}`
-      : `${op === 'delete' ? 'Delete' : 'Remove'} ${removeTags.length} tags`
+      ? `${verb} tag: ${safe(removeTags[0])}${scopeNote}`
+      : `${verb} ${removeTags.length} tags${scopeNote}`
 
   return finalize(opId, op, label, removeTags, mutations, skipped)
 }
@@ -670,7 +706,13 @@ export function planOperation(
       return planAssign(opId, safeCharacters, tags, safeInput.selectedIds ?? [])
     }
     case 'remove':
-      return planRemoval(opId, 'remove', safeCharacters, cleanTagList(safeInput.tags))
+      return planRemoval(
+        opId,
+        'remove',
+        safeCharacters,
+        cleanTagList(safeInput.tags),
+        'selectedIds' in safeInput ? safeInput.selectedIds : undefined,
+      )
     case 'rename':
       return planRename(opId, safeCharacters, safeInput.from, safeInput.to)
     case 'merge':

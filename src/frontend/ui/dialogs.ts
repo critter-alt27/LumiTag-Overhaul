@@ -1221,6 +1221,94 @@ function openBulkAssignReview(host: DialogHost): void {
 }
 
 // ---------------------------------------------------------------------------
+// bulk_unassign_review
+// ---------------------------------------------------------------------------
+
+/**
+ * Review a selection-scoped unassignment before it is written.
+ *
+ * Deliberately destructive-shaped UI (warning confirm, "Unassign" wording) even
+ * though the planner is non-destructive: the user asked to take tags OFF, and a
+ * review that read like an assignment would understate what they are about to do.
+ *
+ * The scope is stated twice — here and in the confirm — because "remove this tag"
+ * without "from these N characters" is exactly how a selection-scoped edit gets
+ * read as a library-wide one.
+ */
+function openBulkUnassignReview(host: DialogHost): void {
+  const { store } = host
+  const handle = openOverlay(
+    host,
+    'Review unassignment',
+    'Unassignment only ever removes the tags below, and only from the selected characters.',
+  )
+
+  const tagNames = store.view.selectedAssignTagKeys.map((key) =>
+    displayName(store.view.tagIndex, key),
+  )
+  const characterIds = [...store.view.selectedCharacterIds]
+  const nameFor = (id: string): string =>
+    store.view.characters.find((c) => c.id === id)?.name || id
+
+  const wrap = el('div', { class: 'lt-dialog__summary' })
+  wrap.appendChild(el('p', {}, [el('strong', {}, [`Tags to remove (${tagNames.length})`])]))
+  wrap.appendChild(cappedList(tagNames))
+  wrap.appendChild(
+    el('p', { class: 'lt-dialog__desc' }, [
+      `Selected characters (${characterIds.length}) — no other character is touched`,
+    ]),
+  )
+  wrap.appendChild(cappedList(characterIds.map(nameFor)))
+  wrap.appendChild(
+    el('p', { class: 'lt-dialog__desc' }, [
+      `Only the tags above are removed from the ${characterCount(characterIds.length)}. Every other tag is ` +
+        'kept, a character that does not carry one of these tags is left untouched, and the result is not one ' +
+        'undoable step.',
+    ]),
+  )
+  handle.replaceBody(wrap)
+
+  if (tagNames.length === 0) {
+    handle.showMessage('warning', 'No tags are selected, so there is nothing to unassign.')
+  } else if (characterIds.length === 0) {
+    handle.showMessage('warning', 'No characters are selected, so there is nothing to unassign.')
+  }
+
+  const ready = tagNames.length > 0 && characterIds.length > 0
+  const confirmButton = button('Unassign tags', {
+    variant: 'danger',
+    onClick: () => {
+      void confirmUnassign(confirmButton)
+    },
+  })
+  setDisabled(confirmButton, !ready)
+  setActions(
+    handle,
+    button('Cancel', { variant: 'ghost', onClick: () => handle.close() }),
+    confirmButton,
+  )
+
+  async function confirmUnassign(control: HTMLButtonElement): Promise<void> {
+    if (control.disabled) return
+    const confirmed = await requestConfirm(
+      host,
+      'Remove these tags?',
+      `Remove ${tagNames.length} tag(s) from ${characterCount(characterIds.length)}. Other tags are ` +
+        'preserved and no other character is changed.',
+      { variant: 'warning', confirmLabel: 'Unassign tags' },
+    )
+    if (!confirmed) return
+    await runAction(
+      handle,
+      control,
+      () => store.actions.runBulkUnassign(tagNames, characterIds),
+      `Unassigned ${tagNames.length} tag(s) from ${characterCount(characterIds.length)}.`,
+      store,
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
 // search_help
 // ---------------------------------------------------------------------------
 
@@ -1321,6 +1409,9 @@ export function openDialog(host: DialogHost, request: DialogRequest): void {
       return
     case 'bulk_assign_review':
       openBulkAssignReview(host)
+      return
+    case 'bulk_unassign_review':
+      openBulkUnassignReview(host)
       return
     case 'search_help':
       openSearchHelp(host, request.context)

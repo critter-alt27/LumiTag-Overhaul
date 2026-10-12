@@ -875,6 +875,148 @@ describe('store.runBulkAssign', () => {
   })
 })
 
+describe('store.runBulkUnassign', () => {
+  test('removes the tags only from the selected characters', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runBulkUnassign(['Elf'], ['c1'])
+
+    // `c1` loses Elf and keeps everything else — the array is never replaced.
+    expect(fake.server.get('c1')?.tags).toEqual(['Magic', 'Knight'])
+    // The scope is the whole safety story here: `c2` also carries Elf and was
+    // NOT selected, so it must be untouched.
+    expect(fake.server.get('c2')?.tags).toEqual(['Elf', 'Dark'])
+
+    const row = store.view.characterRows.find((r) => r.character.id === 'c1')
+    expect(row?.tags).toEqual(['Magic', 'Knight'])
+    expect(store.view.tagIndex.byKey.get('elf')?.count).toBe(1)
+  })
+
+  test('a selected character that lacks the tag is not written', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    const writesBefore = fake.batchWrites.length
+    await store.actions.runBulkUnassign(['Elf'], ['c3', 'c4'])
+
+    // `c3` has Magic only and `c4` has no tags: neither is a no-op write, so
+    // this operation must produce NO write at all.
+    expect(fake.batchWrites.length).toBe(writesBefore)
+    expect(fake.server.get('c3')?.tags).toEqual(['Magic'])
+    expect(fake.server.get('c4')?.tags).toEqual([])
+    expect(store.view.reports.at(-1)?.status).toBe('succeeded')
+  })
+
+  test('removes several tags at once from one character', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runBulkUnassign(['Elf', 'Magic'], ['c1'])
+
+    expect(fake.server.get('c1')?.tags).toEqual(['Knight'])
+  })
+
+  test('is subtractive and non-destructive: unrelated tags survive', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    // Case-insensitive match, and the original spelling/order of what remains.
+    await store.actions.runBulkUnassign(['elf'], ['c2'])
+
+    expect(fake.server.get('c2')?.tags).toEqual(['Dark'])
+  })
+
+  test('an empty tag list or an empty selection writes nothing', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    const writesBefore = fake.batchWrites.length
+    const reportsBefore = store.view.reports.length
+
+    await store.actions.runBulkUnassign([], ['c1'])
+    await store.actions.runBulkUnassign(['Elf'], [])
+
+    expect(fake.batchWrites.length).toBe(writesBefore)
+    expect(store.view.reports.length).toBe(reportsBefore)
+    expect(fake.server.get('c1')?.tags).toEqual(['Elf', 'Magic', 'Knight'])
+  })
+
+  test('costs ONE batched write and ONE batched read, like any bulk edit', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    fake.batchWrites.length = 0
+    fake.batchGets.length = 0
+    await store.actions.runBulkUnassign(['Elf'], ['c1', 'c2'])
+
+    expect(fake.batchWrites).toHaveLength(1)
+    expect(fake.batchWrites[0]?.map((w) => w.characterId).sort()).toEqual(['c1', 'c2'])
+    expect(fake.batchGets).toHaveLength(1)
+  })
+
+  test('a partial failure is reported per character and retryable per character', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    fake.failWrites('c2', new Error('network unreachable'), 1)
+    await store.actions.runBulkUnassign(['Elf'], ['c1', 'c2'])
+
+    const report = store.view.reports.at(-1)
+    expect(report?.op).toBe('remove')
+    // A label that reads as library-wide would misreport what was attempted.
+    expect(report?.label).toBe('Remove tag: Elf from selection')
+    expect(report?.status).toBe('partially_completed')
+    // The successful write is saved; the failed one keeps its tag.
+    expect(fake.server.get('c1')?.tags).toEqual(['Magic', 'Knight'])
+    expect(fake.server.get('c2')?.tags).toEqual(['Elf', 'Dark'])
+    expect(report?.totals.succeeded).toBe(1)
+    expect(report?.totals.failed).toBe(1)
+    expect(report?.totals.remaining).toBe(1)
+    // The character that succeeded is still reported as resolved, so a retry
+    // can never re-remove from it.
+    expect(report?.results.filter((r) => r.state === 'succeeded')).toHaveLength(1)
+    // The catalog is rebuilt from the confirmed read: Elf survives on exactly
+    // the one character whose write failed.
+    expect(store.view.tagIndex.byKey.get('elf')?.count).toBe(1)
+
+    // The failure is recoverable: retrying recovers it without re-writing the
+    // character that already succeeded.
+    const failed = report?.results.find((r) => r.state === 'failed')
+    expect(failed).toBeDefined()
+    await store.actions.retryOne(report!.opId, failed!.mutationId)
+
+    expect(fake.server.get('c2')?.tags).toEqual(['Dark'])
+    // `c1` was resolved on the first attempt and is NOT rewritten by the retry.
+    expect(fake.server.get('c1')?.tags).toEqual(['Magic', 'Knight'])
+    expect(store.view.reports.at(-1)?.status).toBe('succeeded')
+    expect(store.view.tagIndex.byKey.has('elf')).toBe(false)
+  })
+
+  test('unassigning the last tag leaves an untagged character, not a broken one', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    await store.actions.runBulkUnassign(['Elf', 'Dark'], ['c2'])
+
+    expect(fake.server.get('c2')?.tags).toEqual([])
+    // `Dark` existed only on `c2`, so it leaves the derived catalog entirely
+    // rather than lingering as a zero-count entry. `Elf` stays: `c1` still
+    // carries it, which is the point of a scoped removal.
+    expect(store.view.tagIndex.byKey.has('dark')).toBe(false)
+    expect(store.view.tagIndex.byKey.get('elf')?.count).toBe(1)
+    expect(store.view.untaggedCount).toBe(2) // c2 and the already-empty c4
+  })
+})
+
 describe('store partial failure and retry', () => {
   test('a partial failure yields partially_completed and retries recover it', async () => {
     const fake = seeded()

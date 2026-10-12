@@ -90,7 +90,7 @@ let searchFocusIntent = false
  */
 let searchCaret = 0
 
-/** Pending debounce for the 1000ms search commit. Survives a re-render on purpose. */
+/** Pending debounce for the 1500ms search commit. Survives a re-render on purpose. */
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 
 /** Session-authenticated, read-only avatar endpoint for a character. */

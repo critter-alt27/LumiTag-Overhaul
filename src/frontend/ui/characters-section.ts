@@ -180,6 +180,17 @@ const pickerOpenState = new Map<string, boolean>()
  */
 const pickerQueries = new Map<string, string>()
 
+/**
+ * Delay before a typed search commits, in ms. Shared by the main search box and
+ * every tag picker.
+ *
+ * Exported so the tests can advance the fake clock by the REAL value: this
+ * constant was changed once (1000 → 1500) without the tests following, and the
+ * picker-rebuild tests then silently stopped rebuilding anything while still
+ * looking like ordinary focus assertions.
+ */
+export const SEARCH_DEBOUNCE_MS = 1500
+
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 let pickerTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -386,7 +397,7 @@ export function renderCharactersSection(options: {
 
     const search = buildSearch('characters', 'Search characters and their tags', view.characterQuery, (value) => {
       if (searchTimer) clearTimeout(searchTimer)
-      searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), 1500)
+      searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), SEARCH_DEBOUNCE_MS)
     })
     bar.appendChild(el('div', { class: 'lt-toolbar__grow' }, [field('Search', search)]))
 
@@ -532,7 +543,7 @@ export function renderCharactersSection(options: {
           pickerQueries.set(config.searchSlot, value)
           pickerOpenState.set(config.searchSlot, true)
           render()
-        }, 1500)
+        }, SEARCH_DEBOUNCE_MS)
       },
     )
     body.appendChild(field('Find a tag', search))
@@ -996,7 +1007,7 @@ export function renderCharactersSection(options: {
     const banner = el('div', {
       class: 'lt-toolbar__banner',
       role: 'group',
-      'aria-label': 'Bulk tag assignment controls',
+      'aria-label': 'Bulk tag assignment and unassignment controls',
     })
     banner.appendChild(
       el('strong', {}, [
@@ -1008,12 +1019,13 @@ export function renderCharactersSection(options: {
     banner.appendChild(
       el('span', {}, [
         hasCharacters
-          ? 'Tick the tags to add. Assignment is ADDITIVE: every selected character keeps the tags ' +
-            'it already has, and only the tags it is missing are added. Nothing is overwritten, ' +
-            'renamed or removed, and the write is not one undoable step.'
+          ? 'Tick the tags to add or remove. Assignment is ADDITIVE: every selected character keeps ' +
+            'the tags it already has, and only the tags it is missing are added. Unassignment is ' +
+            'SCOPED: only the selected characters lose the ticked tags, and their other tags are ' +
+            'kept. Neither is one undoable step.'
           : 'No characters are selected yet. Tick a character above, or use “Select All (visible ' +
-            'list only)” below, then pick the tags to add. Assignment is additive — existing tags ' +
-            'are always kept.',
+            'list only)” below, then pick the tags to add or remove. Assignment adds tags; ' +
+            'unassignment removes them from the selected characters only.',
       ]),
     )
 
@@ -1068,13 +1080,30 @@ export function renderCharactersSection(options: {
     setDisabled(assign, !(hasCharacters && hasTags))
     actions.appendChild(assign)
 
+    // The mirror of Assign: same selection, same tags, subtracted instead of
+    // added. It sits immediately after Assign so the pair reads as add/remove on
+    // one shared selection, and it is `secondary`/not-`primary` so the two
+    // buttons never look equally weighted.
+    const unassign = button('Unassign Tags', {
+      variant: 'default',
+      title: hasCharacters && hasTags
+        ? 'Review the removal before anything is written — only the selected characters lose these tags'
+        : 'Select at least one character and at least one tag first',
+      ariaLabel:
+        'Review and remove the selected tags from the selected characters only, leaving other tags intact',
+      onClick: () => requestDialog({ kind: 'bulk_unassign_review' }),
+    })
+    setDisabled(unassign, !(hasCharacters && hasTags))
+    actions.appendChild(unassign)
+
     banner.appendChild(actions)
 
     const picker = renderTagPicker({
-      title: 'Tags to assign',
+      title: 'Tags to assign or unassign',
       description:
-        'Only tags that already exist can be assigned. Characters that already carry a chosen tag ' +
-        'are left untouched for that tag, so re-running an assignment changes nothing.',
+        'Only tags that already exist can be picked. Characters that already carry a chosen tag ' +
+        'are left untouched by an assignment, and characters that do not carry one are left ' +
+        'untouched by an unassignment, so re-running either changes nothing.',
       searchSlot: 'assign-tags',
       searchLabel: 'Search existing tags to assign',
       searchValue: pickerQueries.get('assign-tags') ?? '',
@@ -1135,7 +1164,9 @@ export function renderCharactersSection(options: {
     // Bulk tag assignment block at the top, collapsible
     const bulkHost = el('div', { class: 'lt-bulk-host' })
     const bulkHeader = el('button', { class: 'lt-bulk-host__toggle', type: 'button', 'aria-expanded': 'true', 'aria-label': 'Toggle bulk tag assignment block' })
-    bulkHeader.appendChild(el('span', { class: 'lt-bulk-host__label' }, ['Bulk Tag Assignment']))
+    bulkHeader.appendChild(
+      el('span', { class: 'lt-bulk-host__label' }, ['Bulk Tag Assignment / Unassignment']),
+    )
     bulkHeader.appendChild(el('span', { class: 'lt-bulk-host__indicator' }, ['▾']))
     const bulkContent = el('div', { class: 'lt-bulk-host__content' })
     bulkContent.appendChild(renderBulkToolbar(view))

@@ -190,6 +190,7 @@ export interface TagManagerActions {
   runMergeTags(primary: string, targets: string[]): Promise<void>
   runDeleteTags(tags: string[]): Promise<void>
   runBulkAssign(tags: string[], characterIds: string[]): Promise<void>
+  runBulkUnassign(tags: string[], characterIds: string[]): Promise<void>
   runRemoveChip(characterId: string, tag: string): Promise<void>
   retryOne(opId: string, mutationId: string): Promise<void>
   retryGroup(opId: string, groupKey: string): Promise<void>
@@ -1038,6 +1039,21 @@ export class TagManagerStore {
       if (!Array.isArray(tags) || tags.length === 0) return
       if (!Array.isArray(characterIds) || characterIds.length === 0) return
       await this.runPlan({ op: 'assign', tags, selectedIds: characterIds })
+    },
+
+    /**
+     * Subtractive, and SCOPED: the chosen tags come off the given characters
+     * only. Every other tag on those characters is preserved — the target array
+     * is derived from the character's original tags, not replaced by "the tags
+     * minus the chosen ones" computed anywhere else.
+     *
+     * A character that does not carry a chosen tag is a no-op and is reported as
+     * skipped, not written.
+     */
+    runBulkUnassign: async (tags, characterIds) => {
+      if (!Array.isArray(tags) || tags.length === 0) return
+      if (!Array.isArray(characterIds) || characterIds.length === 0) return
+      await this.runPlan({ op: 'remove', tags, selectedIds: characterIds })
     },
 
     /**

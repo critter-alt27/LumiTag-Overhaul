@@ -37,7 +37,8 @@ import { afterEach, describe, expect, jest, test } from 'bun:test'
 
 import type { CharacterListRow, StoreView, TagManagerStore } from '../src/frontend/store'
 import { buildTagIndex } from '../src/frontend/tag-index'
-import { renderCharactersSection } from '../src/frontend/ui/characters-section'
+import { renderCharactersSection, SEARCH_DEBOUNCE_MS } from '../src/frontend/ui/characters-section'
+import { setDialogOpener } from '../src/frontend/ui/dialog-host'
 import type { LumiTagCharacter } from '../src/shared/types'
 
 // ---------------------------------------------------------------------------
@@ -451,7 +452,10 @@ function typeIntoPickerAndCommit(
   search.value = value
   search.setSelectionRange(caret, caret)
   search.dispatch('input')
-  jest.advanceTimersByTime(1000)
+  // The REAL debounce, not a literal: a hardcoded 1000 here outlived the
+  // source's move to 1500 and left these tests asserting against a rebuild
+  // that never happened.
+  jest.advanceTimersByTime(SEARCH_DEBOUNCE_MS)
   jest.useRealTimers()
 }
 
@@ -780,5 +784,117 @@ describe('characters section search focus restoration', () => {
       handle.destroy()
     }).not.toThrow()
     expect(container.childNodes.length).toBe(0)
+  })
+})
+
+describe('characters section bulk assign / unassign controls', () => {
+  /** The button whose visible label is exactly `label`. */
+  function buttonByLabel(container: StubElement, label: string): StubElement {
+    for (const found of container.querySelectorAll('button')) {
+      if (found.textContent.trim() === label) return found
+    }
+    throw new Error(`no button labelled "${label}"`)
+  }
+
+  function bulkButtons(container: StubElement): {
+    assign: StubElement
+    unassign: StubElement
+  } {
+    return {
+      assign: buttonByLabel(container, 'Assign Tags'),
+      unassign: buttonByLabel(container, 'Unassign Tags'),
+    }
+  }
+
+  test('Unassign Tags sits in the same block, right after Assign Tags', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    mount(container, makeView())
+
+    const { assign, unassign } = bulkButtons(container)
+    // Same parent = the same block, and assign immediately precedes unassign, so
+    // the pair reads as add/remove on one shared selection.
+    expect(unassign.parentNode).toBe(assign.parentNode)
+    const siblings = (assign.parentNode as unknown as { childNodes: StubElement[] }).childNodes
+    expect(siblings.indexOf(unassign)).toBe(siblings.indexOf(assign) + 1)
+  })
+
+  /**
+   * The stub has no `disabled` property, so assert on the `aria-disabled`
+   * mirror `setDisabled` always writes alongside it.
+   */
+  function isDisabled(element: StubElement): boolean {
+    return element.getAttribute('aria-disabled') === 'true'
+  }
+
+  test('both are disabled until characters AND tags are selected', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+    let handle = mount(container, makeView())
+
+    const { assign, unassign } = bulkButtons(container)
+    expect(isDisabled(assign)).toBe(true)
+    expect(isDisabled(unassign)).toBe(true)
+
+    // Characters but no tags: still nothing to do, either way.
+    handle.destroy()
+    handle = mount(container, makeView({ selectedCharacterIds: ['c1'] }))
+    expect(isDisabled(bulkButtons(container).unassign)).toBe(true)
+
+    // Both selected: both become live.
+    handle.destroy()
+    handle = mount(container, makeView({ selectedCharacterIds: ['c1'], selectedAssignTagKeys: ['elf'] }))
+    expect(isDisabled(bulkButtons(container).assign)).toBe(false)
+    expect(isDisabled(bulkButtons(container).unassign)).toBe(false)
+  })
+
+  test('the two buttons request different dialogs', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    const opened: string[] = []
+    setDialogOpener((request) => opened.push(request.kind))
+    try {
+      mount(container, makeView({ selectedCharacterIds: ['c1'], selectedAssignTagKeys: ['elf'] }))
+      const { assign, unassign } = bulkButtons(container)
+
+      assign.dispatch('click')
+      unassign.dispatch('click')
+
+      // They must not share a review dialog: the wording, the scope and the
+      // confirm variant all differ.
+      expect(opened).toEqual(['bulk_assign_review', 'bulk_unassign_review'])
+    } finally {
+      setDialogOpener(() => {})
+    }
+  })
+
+  test('the unassign control tells the reader it is scoped to the selection', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    mount(container, makeView({ selectedCharacterIds: ['c1'], selectedAssignTagKeys: ['elf'] }))
+
+    const { unassign } = bulkButtons(container)
+    // An unassign control that does not say it is scoped reads as a library-wide
+    // delete of the tag — the exact misreading that loses data.
+    expect(unassign.getAttribute('aria-label')).toContain('selected characters only')
+    expect(unassign.getAttribute('title')).toContain('only the selected characters')
+  })
+
+  test('one shared tag picker feeds both buttons', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    mount(container, makeView({ selectedCharacterIds: ['c1'], selectedAssignTagKeys: ['elf'] }))
+
+    // Still exactly ONE assign-tags slot: the pair shares one selection rather
+    // than carrying two independent tag sets that can disagree.
+    expect(allSearches(container).map((s) => s.getAttribute('data-lt-search'))).toEqual([
+      'characters',
+      'active-filter-tags',
+      'assign-tags',
+    ])
   })
 })
