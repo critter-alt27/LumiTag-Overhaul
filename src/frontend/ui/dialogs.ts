@@ -39,7 +39,7 @@
 import { classifyError } from '../mutations/executor'
 import { validateNewTagName, validateRenameTarget } from '../mutations/planner'
 import { summarizeReport, type OperationReport } from '../mutations/report'
-import { SEARCHABLE_FIELD_LABELS, type SearchHelpSection } from '../search/search-help'
+import { type SearchHelpSection } from '../search/search-help'
 import type { TagManagerStore, StoreView } from '../store'
 import { tagKey, type TagEntry } from '../tag-index'
 import { setDialogOpener } from './dialog-host'
@@ -1344,28 +1344,6 @@ function openSearchHelp(host: DialogHost, context: 'tags' | 'characters'): void 
   for (const section of host.store.actions.searchHelp(context)) {
     wrap.appendChild(renderHelpSection(section))
   }
-
-  const fields = el('div')
-  fields.appendChild(el('h4', { class: 'lt-dialog__title' }, ['Exactly what A: searches']))
-  fields.appendChild(
-    el('p', { class: 'lt-dialog__desc' }, [
-      'A: matches only these character fields:',
-    ]),
-  )
-  const fieldList = el('div', { class: 'lt-dialog__list' })
-  for (const [key, label] of Object.entries(SEARCHABLE_FIELD_LABELS)) {
-    const line = el('div', { class: 'lt-row lt-row--wrap' })
-    line.appendChild(el('code', {}, [`A:${key}`]))
-    line.appendChild(el('span', { class: 'lt-dialog__desc' }, [label]))
-    fieldList.appendChild(line)
-  }
-  fields.appendChild(fieldList)
-  fields.appendChild(
-    el('p', { class: 'lt-dialog__desc' }, [
-      'A: never searches tag names. To search tags, use T: instead.',
-    ]),
-  )
-  wrap.appendChild(fields)
 
   if (context === 'tags') {
     const note = el('div')

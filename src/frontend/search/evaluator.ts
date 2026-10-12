@@ -12,22 +12,19 @@
  *   - `tag` (T:) is a case-insensitive comparison of the WHOLE tag name.
  *   - `name` (bare) and `char` (C:) are case-insensitive substring matches
  *     against the character name only.
- *   - `any` (A:) is a case-insensitive substring match across
- *     SEARCHABLE_FIELDS only. See src/shared/types.ts for the exact list.
  *   - An empty term value is treated as a non-matching positive predicate
  *     (and therefore a matching negated one). The parser already rejects
  *     empty prefixed values, so this is a defensive edge case only.
  */
 
-import { SEARCHABLE_FIELDS, type LumiTagCharacter } from '../../shared/types'
+import type { LumiTagCharacter } from '../../shared/types'
 import type { ParsedQuery, QueryTerm } from './parser'
 
 export interface MatchContext {
-  /** Normalized lowercase searchable text, keyed by field. */
-  fields: Record<string, string>
+  /** Lowercased character name. */
+  name: string
   /** Lowercased tag names. */
   tagKeys: Set<string>
-  name: string
 }
 
 function readString(value: unknown): string {
@@ -51,17 +48,17 @@ function readTags(character: LumiTagCharacter): string[] {
  * nested loops is what keeps large libraries slow.
  */
 export function buildMatchContext(character: LumiTagCharacter): MatchContext {
-  const fields: Record<string, string> = {}
-  for (const field of SEARCHABLE_FIELDS) {
-    fields[field] = readString(character[field]).toLowerCase()
-  }
+  // `name` is read explicitly rather than derived from a field list: it is the
+  // only character field the search language reaches, and routing it through a
+  // list is what made removing that list silently break bare/C: search.
+  const name = readString(character.name).toLowerCase()
 
   const tagKeys = new Set<string>()
   for (const tag of readTags(character)) {
     tagKeys.add(tag.toLowerCase())
   }
 
-  return { fields, tagKeys, name: fields.name ?? '' }
+  return { name, tagKeys }
 }
 
 /**
@@ -82,14 +79,6 @@ function matchesPositive(term: QueryTerm, ctx: MatchContext): boolean {
     case 'name':
       // Name only. `C:` locates characters by name; it is NOT a field search.
       return ctx.name.includes(value)
-
-    case 'any':
-      // Searchable fields only — never claim fields the extension cannot read.
-      for (const field of SEARCHABLE_FIELDS) {
-        const text = ctx.fields[field]
-        if (text !== undefined && text.includes(value)) return true
-      }
-      return false
 
     default:
       return false

@@ -26,20 +26,28 @@
  *     the section on every store change, so this renderer does not subscribe
  *     to the store itself (a second subscription would leak one listener per
  *     shell render). `destroy()` is still complete for a standalone caller.
- *  6. **Bounded rendering.** At most {@link ROW_LIMIT} rows are rendered
- *     eagerly; the rest are reported as a count so a huge catalog cannot
- *     freeze the drawer.
+ *  6. **Paged rendering.** At most {@link TAG_PAGE_SIZE} rows are rendered per
+ *     page so a huge catalog cannot freeze the drawer. Tag selection is GLOBAL
+ *     and survives a page change; counts always come from the store.
  */
 
-import type { StoreView, TagListRow, TagManagerStore, TagMode } from '../store'
+import {
+  TAG_PAGE_SIZE,
+  type StoreView,
+  type TagListRow,
+  type TagManagerStore,
+  type TagMode,
+} from '../store'
 import { charactersForTag } from '../tag-index'
 import { TAG_SORT_LABELS, TAG_SORT_MODES } from '../tag-sorting'
 import type { TagSortMode } from '../tag-sorting'
 import { requestDialog } from './dialog-host'
-import { avatar, button, clear, el, emptyState, field, on, sectionEl, spinner, text } from './dom'
+import { avatar, button, clear, el, emptyState, field, on, pager, sectionEl, spinner, text } from './dom'
 
-/** Hard cap on eagerly rendered tag rows. */
-const ROW_LIMIT = 500
+/**
+ * Per-page row cap for the Tags list. The rows themselves come from
+ * `view.tagPageRows`, which the store already sliced.
+ */
 
 /** Hard cap on eagerly rendered characters in any one sub-list. */
 const CHARACTER_LIMIT = 200
@@ -444,8 +452,9 @@ export function renderTagsSection(options: {
     list.setAttribute('role', 'list')
     list.setAttribute('aria-label', 'Tags')
 
-    const shown = Math.min(rows.length, ROW_LIMIT)
-    for (const row of rows.slice(0, shown)) {
+    // Only the current page is rendered; `tagRows` (every match) stays in the
+    // view because Select All and the library-wide tag operations need it.
+    for (const row of view.tagPageRows) {
       list.appendChild(renderTagRow(view, row))
       if (row.expanded) {
         const expanded = renderExpanded(view, row)
@@ -453,13 +462,15 @@ export function renderTagsSection(options: {
       }
     }
 
-    if (rows.length > shown) {
-      list.appendChild(
-        el('p', { class: 'lt-state__detail' }, [
-          `Showing ${shown} of ${rows.length} — refine your search to see the rest.`,
-        ]),
-      )
-    }
+    const controls = pager({
+      page: view.tagPage,
+      pageCount: view.tagPageCount,
+      total: rows.length,
+      pageSize: TAG_PAGE_SIZE,
+      label: 'tags',
+      onPage: (page) => store.actions.setTagPage(page),
+    })
+    if (controls) list.appendChild(controls)
 
     return list
   }

@@ -63,6 +63,45 @@ export type CharacterSortMode =
 
 export type CharacterTagFilter = 'all' | 'any' | 'all_of' | 'has_tags' | 'no_tags'
 
+/**
+ * Rows rendered per page in the Characters and Tags lists.
+ *
+ * These are VIEW page sizes, not load limits: the store still holds the whole
+ * library, so counts, filters and every library-wide operation stay exact. They
+ * match the previous hard render caps (300 characters, 500 tags), so page 1 is
+ * exactly what used to render.
+ */
+export const CHARACTER_PAGE_SIZE = 300
+export const TAG_PAGE_SIZE = 500
+
+/**
+ * Clamp a requested page into `[0, count)`.
+ *
+ * `count === 0` collapses to page 0: an empty result set has no page 3, and
+ * rendering "page 3 of 0" is the kind of thing that reads as a broken list
+ * rather than an empty one.
+ */
+export function clampPage(page: number, count: number): number {
+  if (count <= 0) return 0
+  if (!Number.isFinite(page)) return 0
+  const floored = Math.floor(page)
+  if (floored < 0) return 0
+  if (floored > count - 1) return count - 1
+  return floored
+}
+
+/** Number of pages needed to show `total` rows, at least 1. */
+export function pageCountFor(total: number, pageSize: number): number {
+  if (pageSize < 1) return 1
+  return Math.max(1, Math.ceil(Math.max(0, total) / pageSize))
+}
+
+/** The `[start, end)` slice of a list belonging to `page`. */
+export function pageSlice<T>(rows: readonly T[], page: number, pageSize: number): T[] {
+  const start = page * pageSize
+  return rows.slice(start, start + pageSize)
+}
+
 /** One row of the Tags list: a catalog entry plus its UI-only state. */
 export interface TagListRow {
   entry: TagEntry
@@ -109,6 +148,19 @@ export interface StoreView {
   mergeValid: boolean
   // Characters section
   characterRows: CharacterListRow[]
+  /**
+   * Rows for the CURRENT page only.
+   *
+   * `characterRows` stays the complete filtered/sorted list because that is
+   * what "Select All" and the library-wide operations mean. This window is what
+   * the list actually renders.
+   */
+  characterPageRows: CharacterListRow[]
+  characterPage: number
+  characterPageCount: number
+  tagPageRows: TagListRow[]
+  tagPage: number
+  tagPageCount: number
   characterQuery: string
   characterQueryErrors: QuerySyntaxError[]
   characterSort: CharacterSortMode
@@ -178,6 +230,8 @@ export interface TagManagerActions {
   clearTagSelection(): void
   exitTagMode(): void
   setCharacterQuery(q: string): void
+  setCharacterPage(page: number): void
+  setTagPage(page: number): void
   setCharacterSort(m: CharacterSortMode): void
   setCharacterTagFilter(f: CharacterTagFilter): void
   setActiveFilterTags(keys: string[]): void
@@ -235,11 +289,10 @@ function uiSafeMessage(error: unknown, fallback: string): string {
 }
 
 function hasCharacterQueryTerm(query: ParsedQuery): boolean {
-  // A: searches character fields and C: searches character names. In the Tags
-  // panel either prefix switches the results from tags to matching characters.
-  return query.groups.some((group) =>
-    group.terms.some((term) => term.field === 'char' || term.field === 'any'),
-  )
+  // `C:` searches character names. In the Tags panel it switches the results
+  // from tags to matching characters, so a tag-only term (`T:`) keeps showing
+  // the tag list.
+  return query.groups.some((group) => group.terms.some((term) => term.field === 'char'))
 }
 
 /** Raw, mutable store state. Nothing here is handed to the UI directly. */
@@ -260,6 +313,10 @@ interface StoreState {
   mergeTargetKeys: Set<string>
   characterQuery: string
   characterSort: CharacterSortMode
+  /** Zero-based page of the CHARACTER list. View-only; see PAGE_SIZE. */
+  characterPage: number
+  /** Zero-based page of the TAG list. View-only; see PAGE_SIZE. */
+  tagPage: number
   characterTagFilter: CharacterTagFilter
   activeFilterTagKeys: Set<string>
   selectedCharacterIds: Set<string>
@@ -286,6 +343,8 @@ function initialState(): StoreState {
     mergeTargetKeys: new Set(),
     characterQuery: '',
     characterSort: 'name_asc',
+    characterPage: 0,
+    tagPage: 0,
     characterTagFilter: 'all',
     activeFilterTagKeys: new Set(),
     selectedCharacterIds: new Set(),
@@ -783,6 +842,15 @@ export class TagManagerStore {
     const characterSide = this.computeCharacterRows()
     const selectedAssign = [...s.selectedAssignTagKeys].sort()
 
+    // Pages are clamped HERE rather than in the actions, because the page count
+    // is a function of the filtered list: narrowing a search or deleting the
+    // last row of the last page can strand a stored page past the end, and the
+    // stored value is never wrong enough to render an empty list.
+    const tagPages = pageCountFor(tagSide.rows.length, TAG_PAGE_SIZE)
+    const tagPage = clampPage(s.tagPage, tagPages)
+    const characterPages = pageCountFor(characterSide.rows.length, CHARACTER_PAGE_SIZE)
+    const characterPage = clampPage(s.characterPage, characterPages)
+
     return {
       section: s.section,
       loadState: s.loadState,
@@ -792,6 +860,9 @@ export class TagManagerStore {
       characterCount: s.characters.length,
       tagIndex: s.tagIndex,
       tagRows: tagSide.rows,
+      tagPageRows: pageSlice(tagSide.rows, tagPage, TAG_PAGE_SIZE),
+      tagPage,
+      tagPageCount: tagPages,
       tagQuery: s.tagQuery,
       tagQueryErrors: tagSide.errors,
       tagQueryIsCharacterMode: tagSide.isCharacterMode,
@@ -807,6 +878,9 @@ export class TagManagerStore {
         s.mergeTargetKeys.size > 0 &&
         !s.mergeTargetKeys.has(s.mergePrimaryKey),
       characterRows: characterSide.rows,
+      characterPageRows: pageSlice(characterSide.rows, characterPage, CHARACTER_PAGE_SIZE),
+      characterPage,
+      characterPageCount: characterPages,
       characterQuery: s.characterQuery,
       characterQueryErrors: characterSide.errors,
       characterSort: s.characterSort,
@@ -839,12 +913,14 @@ export class TagManagerStore {
     setTagQuery: (tagQuery) => {
       if (this.state.tagQuery === tagQuery) return
       this.state.tagQuery = tagQuery
+      this.state.tagPage = 0
       this.commit()
     },
 
     setTagSort: (tagSort) => {
       if (this.state.tagSort === tagSort) return
       this.state.tagSort = tagSort
+      this.state.tagPage = 0
       this.commit()
     },
 
@@ -937,18 +1013,25 @@ export class TagManagerStore {
     setCharacterQuery: (characterQuery) => {
       if (this.state.characterQuery === characterQuery) return
       this.state.characterQuery = characterQuery
+      // A new query reorders the result set, so the old page number means
+      // something else. Returning to page 1 is the only predictable answer.
+      this.state.characterPage = 0
       this.commit()
     },
 
     setCharacterSort: (characterSort) => {
       if (this.state.characterSort === characterSort) return
       this.state.characterSort = characterSort
+      // Sorting reorders the list, so page 1 again rather than a page number
+      // that now points at a different slice.
+      this.state.characterPage = 0
       this.commit()
     },
 
     setCharacterTagFilter: (characterTagFilter) => {
       if (this.state.characterTagFilter === characterTagFilter) return
       this.state.characterTagFilter = characterTagFilter
+      this.state.characterPage = 0
       this.commit()
     },
 
@@ -956,6 +1039,7 @@ export class TagManagerStore {
       const next = new Set((Array.isArray(keys) ? keys : []).map((k) => tagKey(k)).filter((k) => k !== ''))
       if (sameSet(next, this.state.activeFilterTagKeys)) return
       this.state.activeFilterTagKeys = next
+      this.state.characterPage = 0
       this.commit()
     },
 
@@ -975,6 +1059,28 @@ export class TagManagerStore {
       const before = set.size
       for (const id of visible) set.add(id)
       if (set.size === before) return
+      this.commit()
+    },
+
+    /**
+     * Jump to a page of the character list.
+     *
+     * The stored value is NOT clamped here — it is clamped when the view is
+     * computed — so a page number that is temporarily out of range (because the
+     * list is still loading, or a filter just narrowed it) does not silently
+     * overwrite where the reader was.
+     */
+    setCharacterPage: (page) => {
+      const next = Number.isFinite(page) ? Math.floor(page) : 0
+      if (this.state.characterPage === next) return
+      this.state.characterPage = next
+      this.commit()
+    },
+
+    setTagPage: (page) => {
+      const next = Number.isFinite(page) ? Math.floor(page) : 0
+      if (this.state.tagPage === next) return
+      this.state.tagPage = next
       this.commit()
     },
 
@@ -1150,7 +1256,7 @@ export class TagManagerStore {
  * section: `Elf -` filters down to `Elf` instead of filtering on the literal
  * text `elf -` and matching nothing.
  *
- * Only `name` terms are used — a `T:`/`A:` term says nothing about a tag's
+ * Only `name` terms are used — a `T:` term says nothing about a tag's
  * NAME, so applying it here would filter on a syntax the tag list does not
  * speak. Negated name terms are skipped for the same reason `filterTagsByName`
  * is a plain positive substring match. With no usable name term at all, the
@@ -1158,7 +1264,7 @@ export class TagManagerStore {
  */
 /**
  * Search the tag catalog using the shared query syntax. Bare terms are
- * case-insensitive name substrings; T: terms match a whole tag name. A:/C:
+ * case-insensitive name substrings; T: terms match a whole tag name. C:
  * terms are handled by character mode before this helper is called.
  */
 function filterTagsByQuery(

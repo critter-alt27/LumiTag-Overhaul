@@ -3,8 +3,6 @@
  * hand-write documentation strings.
  */
 
-import type { SearchableField } from '../../shared/types'
-
 export interface SearchHelpEntry {
   syntax: string
   description: string
@@ -14,20 +12,6 @@ export interface SearchHelpSection {
   title: string
   entries: SearchHelpEntry[]
 }
-
-/** Human-readable labels for the exact fields `A:` searches. */
-export const SEARCHABLE_FIELD_LABELS: Record<SearchableField, string> = {
-  name: 'Name',
-  description: 'Description',
-  personality: 'Personality',
-  scenario: 'Scenario',
-  creator: 'Creator',
-  creator_notes: 'Creator notes',
-}
-
-const SEARCHABLE_FIELD_LIST = Object.keys(SEARCHABLE_FIELD_LABELS)
-  .map((key) => SEARCHABLE_FIELD_LABELS[key as SearchableField])
-  .join(', ')
 
 function prefixSections(characterPrefixNote: string): SearchHelpSection[] {
   return [
@@ -42,10 +26,6 @@ function prefixSections(characterPrefixNote: string): SearchHelpSection[] {
           syntax: 'T:Elf',
           description:
             'Tag name search. Matches the whole tag name, so T:Elf does not match a tag called ElfKing.',
-        },
-        {
-          syntax: 'A:John',
-          description: `Searches these character fields: ${SEARCHABLE_FIELD_LIST}.`,
         },
         {
           syntax: 'C:John',
@@ -65,9 +45,8 @@ function prefixSections(characterPrefixNote: string): SearchHelpSection[] {
           description: 'Commas mean OR — the character needs either tag.',
         },
         {
-          syntax: 'A:John, T:Elf T:Magic',
-          description:
-            'Mixes both: this reads as (A:John) OR (T:Elf AND T:Magic).',
+          syntax: 'C:John, T:Elf T:Magic',
+          description: 'Mixes both: this reads as (C:John) OR (T:Elf AND T:Magic).',
         },
       ],
     },

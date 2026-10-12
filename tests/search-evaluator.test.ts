@@ -150,44 +150,38 @@ describe('T: tag search', () => {
   })
 })
 
-describe('A: searchable-field search', () => {
-  test('matches across every supported field', () => {
-    const cases: Array<[string, string]> = [
-      ['name', 'Aria'],
-      ['description', 'scholar'],
-      ['personality', 'chatty'],
-      ['scenario', 'autumn'],
-      ['creator', 'Rowan'],
-      ['creator_notes', 'Steinbeck'],
-    ]
+describe('A: was removed and degrades to a name search', () => {
+  test('SEARCHABLE_FIELDS is now name-only', () => {
+    expect([...SEARCHABLE_FIELDS]).toEqual(['name'])
+  })
 
-    for (const [field, value] of cases) {
-      const subject = makeCharacter({ [field]: `zzunique-${value}-${field}` })
-      const result = searchCharacters(q(`A:zzunique-${value}-${field}`), [subject])
-      expect(result.length, `A: should search ${field}`).toBe(1)
-      expect(result[0]).toBe(subject)
+  test('a retired A: term is a plain name search for the literal text', () => {
+    const fixtures = makeFixtures()
+    // The prefix is no longer special, so `A:Aria` searches names for the
+    // SUBSTRING "a:aria" — which no name contains. It degrades rather than
+    // erroring, so a saved query keeps running instead of failing.
+    expect(ids(searchCharacters(q('A:Aria'), fixtures))).toEqual([])
+    // The same characters without the retired prefix still match.
+    expect(ids(searchCharacters(q('Aria'), fixtures))).toEqual(['elf-mage'])
+  })
+
+  test('prose fields are no longer reachable by any operator', () => {
+    // The regression this guards: prose search is gone, so a value that only
+    // exists in `description` must match NOTHING, not fall back to a field
+    // search that still exists.
+    const subject = makeCharacter({ description: 'zzunique-scholar-prose' })
+    for (const query of ['A:zzunique-scholar-prose', 'zzunique-scholar-prose']) {
+      expect(searchCharacters(q(query), [subject]), query).toEqual([])
     }
   })
 
-  test('searches exactly the six documented fields', () => {
-    expect([...SEARCHABLE_FIELDS]).toEqual([
-      'name',
-      'description',
-      'personality',
-      'scenario',
-      'creator',
-      'creator_notes',
-    ])
-  })
-
-  test('does NOT search unsupported fields such as system_prompt', () => {
-    const subject = makeCharacter({ system_prompt: 'zzsecret-system-prompt' })
-    expect(searchCharacters(q('A:zzsecret-system-prompt'), [subject])).toEqual([])
-  })
-
-  test('is case-insensitive', () => {
+  test('name and C: still work after the field list collapsed to one entry', () => {
+    // `ctx.name` used to be derived by iterating SEARCHABLE_FIELDS; removing all
+    // but `name` must not have emptied it.
     const fixtures = makeFixtures()
-    expect(ids(searchCharacters(q('A:SCHOLAR'), fixtures))).toEqual(['elf-mage'])
+    expect(ids(searchCharacters(q('Aria'), fixtures))).toEqual(['elf-mage'])
+    expect(ids(searchCharacters(q('C:Aria'), fixtures))).toEqual(['elf-mage'])
+    expect(ids(searchCharacters(q('c:ARIA'), fixtures))).toEqual(['elf-mage'])
   })
 })
 
@@ -200,10 +194,12 @@ describe('C: character search', () => {
   })
 
   test('is not a search across other fields', () => {
-    // Johnny's description mentions "John" but his name does not.
+    // Johnny's description mentions "John" but his name does not. With A:
+    // removed there is no operator that can reach prose any more, so NO
+    // operator finds him.
     expect(ids(searchCharacters(q('C:John'), fixtures))).toEqual([])
-    // ...while A: does find him.
-    expect(ids(searchCharacters(q('A:John'), fixtures))).toEqual(['johnny'])
+    expect(ids(searchCharacters(q('A:John'), fixtures))).toEqual([])
+    expect(ids(searchCharacters(q('John'), fixtures))).toEqual([])
   })
 })
 
@@ -233,14 +229,16 @@ describe('OR groups', () => {
 describe('mixed AND/OR', () => {
   const fixtures = makeFixtures()
 
-  test('A:John, T:Elf T:Magic reads as (A:John) OR (T:Elf AND T:Magic)', () => {
-    const actual = ids(searchCharacters(q('A:John, T:Elf T:Magic'), fixtures)).sort()
+  test('C:John, T:Elf T:Magic reads as (C:John) OR (T:Elf AND T:Magic)', () => {
+    const actual = ids(searchCharacters(q('C:John, T:Elf T:Magic'), fixtures)).sort()
 
     const orResult = ids(
-      searchCharacters(q('A:John'), fixtures).concat(searchCharacters(q('T:Elf T:Magic'), fixtures)),
+      searchCharacters(q('C:John'), fixtures).concat(searchCharacters(q('T:Elf T:Magic'), fixtures)),
     )
     expect(actual).toEqual([...new Set(orResult)].sort())
-    expect(actual).toEqual(['elf-mage', 'johnny'])
+    // `C:` is name-only, so the name arm contributes nobody here; the result is
+    // the tag arm alone. The OR structure is what this test is about.
+    expect(actual).toEqual(['elf-mage'])
   })
 })
 
@@ -280,8 +278,11 @@ describe('case-insensitivity of prefixes and values', () => {
       'elf-dark',
       'elf-mage',
     ])
-    expect(ids(searchCharacters(q('a:SCHOLAR'), fixtures))).toEqual(['elf-mage'])
     expect(ids(searchCharacters(q('c:aria'), fixtures))).toEqual(['elf-mage'])
+    expect(ids(searchCharacters(q('t:ELF'), fixtures)).sort()).toEqual([
+      'elf-dark',
+      'elf-mage',
+    ])
   })
 })
 
@@ -334,7 +335,7 @@ describe('empty term value (defensive)', () => {
   const fixtures = makeFixtures()
 
   test('an empty positive value matches nothing', () => {
-    for (const field of ['name', 'tag', 'any', 'char'] as const) {
+    for (const field of ['name', 'tag', 'char'] as const) {
       const result = searchCharacters({ groups: [{ terms: [{ field, value: '', negated: false }] }], empty: false }, fixtures)
       expect(result, `empty ${field} value must not match`).toEqual([])
     }
@@ -355,7 +356,7 @@ describe('purity', () => {
     const before = JSON.stringify(fixtures)
 
     searchCharacters(q('T:Elf -T:Dark'), fixtures)
-    searchCharacters(q('A:John, T:Elf T:Magic'), fixtures)
+    searchCharacters(q('C:John, T:Elf T:Magic'), fixtures)
 
     expect(JSON.stringify(fixtures)).toBe(before)
   })
@@ -403,9 +404,8 @@ describe('lower-level API', () => {
   const fixtures = makeFixtures()
   const ctx = buildMatchContext(fixtures[0])
 
-  test('buildMatchContext lowercases fields and tag names', () => {
+  test('buildMatchContext lowercases the name and tag names', () => {
     expect(ctx.name).toBe('aria the wise')
-    expect(ctx.fields.creator).toBe('rowan')
     expect(ctx.tagKeys.has('elf')).toBe(true)
     expect(ctx.tagKeys.has('magic')).toBe(true)
   })

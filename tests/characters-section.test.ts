@@ -348,6 +348,12 @@ function makeView(overrides: Partial<StoreView> = {}): StoreView {
   }))
   return {
     section: 'characters',
+    tagPage: 0,
+    tagPageCount: 1,
+    tagPageRows: [],
+    characterPage: 0,
+    characterPageCount: 1,
+    characterPageRows: characterRows,
     loadState: 'ready',
     loadError: null,
     isRefreshing: false,
@@ -729,7 +735,38 @@ describe('characters section search focus restoration', () => {
     expect(after.selectionStart).toBe(4)
   })
 
-  test('truncating the tag options does not cost the focused picker box its focus', () => {
+  test('a picker with more options than one page pages them instead of hiding them', () => {
+    currentDoc = installDom()
+    const doc = currentDoc
+    const container = newContainer(doc)
+
+    // 205 distinct tags — one more than the picker's 200-per-page.
+    const many: LumiTagCharacter[] = []
+    for (let i = 0; i < 205; i += 1) many.push(character(`m${i}`, `Character ${i}`, [`tag-${i}`]))
+    const bigIndex = buildTagIndex(many)
+
+    mount(container, makeView({ characters: many, characterCount: many.length, tagIndex: bigIndex, characterRows: [] }))
+
+    // The picker query is module state that deliberately survives renders, so an
+    // earlier test's query would silently change what matches here. Set one that
+    // matches every tag so this test stands on its own.
+    typeIntoPickerAndCommit(searchIn(container, 'assign-tags'), 'tag-', 4)
+
+    // The overflow is PAGED, not truncated: the picker shows exactly one page
+    // of options and offers the rest.
+    const checkboxes = container.querySelectorAll('input[type="checkbox"]')
+    expect(checkboxes.length).toBeGreaterThanOrEqual(200)
+    expect(checkboxes.length).toBeLessThanOrEqual(400)
+
+    const pickers = container.querySelectorAll('.lt-pager')
+    expect(pickers.length).toBeGreaterThan(0)
+    const overflow = pickers.find((p) => p.textContent.includes('of 205 tags'))
+    expect(overflow).toBeDefined()
+    expect(overflow!.textContent).toContain('Showing 1–200 of 205 tags')
+    expect(overflow!.textContent).toContain('Page 1 of 2')
+  })
+
+test('truncating the tag options does not cost the focused picker box its focus', () => {
     currentDoc = installDom()
     const doc = currentDoc
 
@@ -784,6 +821,143 @@ describe('characters section search focus restoration', () => {
       handle.destroy()
     }).not.toThrow()
     expect(container.childNodes.length).toBe(0)
+  })
+})
+
+describe('characters section paging', () => {
+  function buttonByLabel(container: StubElement, label: string): StubElement {
+    for (const found of container.querySelectorAll('button')) {
+      if (found.textContent.trim() === label) return found
+    }
+    throw new Error(`no button labelled "${label}"`)
+  }
+
+  /** A view whose character list spans `pages` pages of `pageSize`. */
+  function pagedView(total: number, pageSize: number): Partial<StoreView> {
+    const characters = Array.from({ length: total }, (_, i) =>
+      character(`c${i}`, `Char ${String(i).padStart(4, '0')}`, ['elf']),
+    )
+    const rows = characters.map((c) => ({ character: c, tags: [...c.tags], selected: false }))
+    const page = 0
+    return {
+      characters,
+      characterCount: total,
+      characterRows: rows,
+      characterPageRows: rows.slice(page * pageSize, (page + 1) * pageSize),
+      characterPage: page,
+      characterPageCount: Math.max(1, Math.ceil(total / pageSize)),
+    }
+  }
+
+  test('a list that fits on one page shows no pager', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    mount(container, makeView({ characterRows: [], characterPageRows: [] }))
+
+    // Inert controls are worse than none: they look like they should do
+    // something.
+    expect(container.querySelector('.lt-pager')).toBeNull()
+  })
+
+  test('a multi-page list shows a pager with an honest range', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    const total = 620
+    const pageSize = 300
+    const view = makeView(pagedView(total, pageSize))
+    mount(container, view)
+
+    const pagerEl = container.querySelector('.lt-pager')
+    expect(pagerEl).not.toBeNull()
+    // "Showing 1–300 of 620" — the reader can tell a page from the whole set.
+    expect(pagerEl!.textContent).toContain('Showing 1–300 of 620 characters')
+    expect(pagerEl!.textContent).toContain('Page 1 of 3')
+  })
+
+  test('only the current page of rows is rendered', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    const view = makeView(pagedView(620, 300))
+    mount(container, view)
+
+    const list = container.querySelector('.lt-list')
+    // Query the CONTAINER: `.lt-list` also matches the bulk block's tag-picker
+    // option list, which is rendered earlier in the frame.
+    const rendered = container.querySelectorAll('.lt-character-row').length
+    expect(rendered).toBe(300)
+  })
+
+  test('Next and Previous request the neighbouring page', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    const requested: number[] = []
+    const view = makeView(pagedView(620, 300))
+    const fake = fakeStore(view)
+    fake.actions.setCharacterPage = (page: number) => {
+      requested.push(page)
+    }
+    renderCharactersSection({
+      container: container as unknown as HTMLElement,
+      store: fake,
+    })
+
+    buttonByLabel(container, 'Next').dispatch('click')
+    expect(requested).toEqual([1])
+
+    buttonByLabel(container, 'First').dispatch('click')
+    expect(requested).toEqual([1, 0])
+
+    buttonByLabel(container, 'Last').dispatch('click')
+    expect(requested).toEqual([1, 0, 2])
+  })
+
+  test('Previous is disabled on the first page and Next on the last', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    const base = pagedView(620, 300)
+    // First page.
+    mount(container, makeView(base))
+    expect(buttonByLabel(container, 'Previous').getAttribute('aria-disabled')).toBe('true')
+    expect(buttonByLabel(container, 'Next').getAttribute('aria-disabled')).toBe('false')
+
+    // Last page.
+    const last = pagedView(620, 300)
+    last.characterPage = 2
+    last.characterPageRows = (last.characterRows as CharacterListRow[]).slice(600, 900)
+    mount(container, makeView(last))
+    expect(buttonByLabel(container, 'Previous').getAttribute('aria-disabled')).toBe('false')
+    expect(buttonByLabel(container, 'Next').getAttribute('aria-disabled')).toBe('true')
+  })
+
+  test('the pager sits BELOW the rows, not above them', () => {
+    currentDoc = installDom()
+    const container = newContainer(currentDoc)
+
+    mount(container, makeView(pagedView(620, 300)))
+
+    // Flatten the frame in DOCUMENT order, the way the stub's own walker does.
+    const inOrder: StubElement[] = []
+    const walk = (node: StubElement): void => {
+      for (const child of (node as unknown as { childNodes: (StubElement | StubText)[] })
+        .childNodes) {
+        if (child instanceof StubText) continue
+        inOrder.push(child)
+        walk(child)
+      }
+    }
+    walk(container)
+
+    // The stub stores `class` as an attribute, not a DOM property.
+    const classOf = (n: StubElement): string => n.getAttribute('class') ?? ''
+    const lastRow = inOrder.map(classOf).lastIndexOf('lt-character-row')
+    const pagerAt = inOrder.findIndex((n) => classOf(n).includes('lt-pager'))
+    expect(lastRow).toBeGreaterThanOrEqual(0)
+    expect(pagerAt).toBeGreaterThan(lastRow)
   })
 })
 

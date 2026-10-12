@@ -66,7 +66,7 @@ describe('tokenize', () => {
   })
 
   test('is deterministic', () => {
-    expect(tokenize('A:John, T:Elf T:Magic')).toEqual(tokenize('A:John, T:Elf T:Magic'))
+    expect(tokenize('C:John, T:Elf T:Magic')).toEqual(tokenize('C:John, T:Elf T:Magic'))
   })
 })
 
@@ -114,9 +114,9 @@ describe('parseQuery — worked examples', () => {
     ['T:Elf T:Magic', 'AND of two tag terms', [[['tag', 'Elf', false], ['tag', 'Magic', false]]]],
     ['T:Elf, T:Magic', 'OR of two single-term groups', [[['tag', 'Elf', false]], [['tag', 'Magic', false]]]],
     [
-      'A:John, T:Elf T:Magic',
-      'mixed AND/OR: (A:John) OR (T:Elf AND T:Magic)',
-      [[['any', 'John', false]], [['tag', 'Elf', false], ['tag', 'Magic', false]]],
+      'C:John, T:Elf T:Magic',
+      'mixed AND/OR: (C:John) OR (T:Elf AND T:Magic)',
+      [[['char', 'John', false]], [['tag', 'Elf', false], ['tag', 'Magic', false]]],
     ],
     ['T:Elf -T:Dark', 'AND with negation', [[['tag', 'Elf', false], ['tag', 'Dark', true]]]],
     ['John', 'bare name term', [[['name', 'John', false]]]],
@@ -143,17 +143,21 @@ describe('parseQuery — worked examples', () => {
 // ---------------------------------------------------------------------------
 
 describe('parseQuery — prefixes', () => {
-  test('recognises T:, A: and C: and nothing else', () => {
+  test('recognises T: and C: and nothing else', () => {
     expect(parseOk('T:Elf').groups[0]!.terms[0]!.field).toBe('tag')
-    expect(parseOk('A:Elf').groups[0]!.terms[0]!.field).toBe('any')
     expect(parseOk('C:Elf').groups[0]!.terms[0]!.field).toBe('char')
+  })
+
+  test('the retired A: prefix degrades to a plain name term', () => {
+    // A: was removed rather than made an error, so a saved query using it keeps
+    // working: it now means exactly what a bare term means.
+    expect(parseOk('A:Elf').groups[0]!.terms[0]).toEqual(term('name', 'A:Elf'))
+    expect(parseOk('-A:Goblin').groups[0]!.terms[0]).toEqual(term('name', 'A:Goblin', true))
   })
 
   test('prefix recognition is case-insensitive but value case is preserved', () => {
     expect(parseOk('t:elf').groups[0]!.terms[0]).toEqual(term('tag', 'elf'))
-    expect(parseOk('A:john').groups[0]!.terms[0]).toEqual(term('any', 'john'))
     expect(parseOk('c:JoHn').groups[0]!.terms[0]).toEqual(term('char', 'JoHn'))
-    expect(parseOk('a:JOHN').groups[0]!.terms[0]).toEqual(term('any', 'JOHN'))
   })
 
   test('an unknown prefix is NOT an error: the whole token is a bare name term', () => {
@@ -301,7 +305,6 @@ describe('parseQuery — negation', () => {
 
   test('negation applies to the whole predicate of prefixed terms', () => {
     expect(parseOk('-T:Elf').groups[0]!.terms[0]).toEqual(term('tag', 'Elf', true))
-    expect(parseOk('-A:Elf').groups[0]!.terms[0]).toEqual(term('any', 'Elf', true))
     expect(parseOk('-C:Elf').groups[0]!.terms[0]).toEqual(term('char', 'Elf', true))
   })
 
@@ -327,11 +330,11 @@ describe('parseQuery — negation', () => {
   })
 
   test('multiple negations inside one group', () => {
-    expect(tree(parseOk('T:Elf -T:Dark -A:Goblin').groups)).toEqual([
+    expect(tree(parseOk('T:Elf -T:Dark -C:Goblin').groups)).toEqual([
       [
         ['tag', 'Elf', false],
         ['tag', 'Dark', true],
-        ['any', 'Goblin', true],
+        ['char', 'Goblin', true],
       ],
     ])
   })
@@ -350,10 +353,8 @@ describe('parseQuery — negation', () => {
 describe('parseQuery — empty prefixed terms', () => {
   for (const [input, field] of [
     ['T:', 'tag'],
-    ['A:', 'any'],
     ['C:', 'char'],
     ['t:', 'tag'],
-    ['a:', 'any'],
     ['c:', 'char'],
   ] as Array<[string, TermField]>) {
     test(`${JSON.stringify(input)} → syntax error`, () => {
@@ -369,10 +370,10 @@ describe('parseQuery — empty prefixed terms', () => {
   }
 
   test('the error token and index point at the token, not the query', () => {
-    const result = parseQuery('T:Elf A:')
+    const result = parseQuery('T:Elf C:')
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.errors[0]!.token).toBe('A:')
+    expect(result.errors[0]!.token).toBe('C:')
     expect(result.errors[0]!.index).toBe(6)
   })
 
@@ -425,22 +426,22 @@ describe('parseQuery — multiple errors in one query', () => {
   })
 
   test('reports every error, not just the first', () => {
-    const result = parseQuery('A: - C: -')
+    const result = parseQuery('T: - C: -')
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.errors).toHaveLength(4)
-    expect(result.errors.map((e) => e.token)).toEqual(['A:', '-', 'C:', '-'])
+    expect(result.errors.map((e) => e.token)).toEqual(['T:', '-', 'C:', '-'])
     expect(result.errors.map((e) => e.index)).toEqual([0, 3, 5, 8])
   })
 
   test('still returns the well-formed terms alongside the errors', () => {
-    const result = parseQuery('T:Elf T: -A:Goblin C:Rin')
+    const result = parseQuery('T:Elf T: -C:Goblin C:Rin')
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(tree(result.query.groups)).toEqual([
       [
         ['tag', 'Elf', false],
-        ['any', 'Goblin', true],
+        ['char', 'Goblin', true],
         ['char', 'Rin', false],
       ],
     ])
@@ -510,7 +511,7 @@ describe('parseTokens', () => {
 
 describe('parseQuery — composition and determinism', () => {
   test('parseQuery equals scanTokens followed by parseTokens', () => {
-    const input = 'A:John, T:Elf -T:Dark'
+    const input = 'C:John, T:Elf -T:Dark'
     expect(parseQuery(input)).toEqual({ ok: true, query: parseTokens(scanTokens(input)).query, errors: [] })
   })
 
@@ -522,10 +523,11 @@ describe('parseQuery — composition and determinism', () => {
     'C:John',
     'T:Elf T:Magic',
     'T:Elf, T:Magic',
-    'A:John, T:Elf T:Magic',
+    'C:John, T:Elf T:Magic',
     'T:Elf -T:Dark, T:Beast',
     'Z:foo',
-    't:elf a:john',
+    'A:John',
+    't:elf c:john',
     'Rin & Mei',
     'T:',
     '-',

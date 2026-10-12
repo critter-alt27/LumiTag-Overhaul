@@ -10,7 +10,11 @@ tab. LumiTag keeps your character tags organized instead of letting them sprawl.
 - **Create, rename, merge, delete tags** — rename a tag everywhere it is used,
   merge two tags into one, and remove tags from characters.
 - **Bulk operations** — select characters by filter or by hand, then add or remove
-  tags across all of them at once.
+  tags across all of them at once. Selections survive paging, so you can tick
+  characters on one page, move to another, and still act on the whole set.
+- **Paged lists** — the character list, tag list and tag pickers are paged rather
+  than truncated, so every item in a large library is reachable. Your library is
+  loaded in full, so counts, filters and tag totals stay exact.
 - **Advanced query language** — filter characters with a compact search syntax
   (see below).
 - **Per-character partial-failure reporting** — a bulk operation never silently
@@ -82,11 +86,14 @@ naturally and are matched against your character library.
 |---|---|
 | `fantasy` | Bare term — matches the character **name** |
 | `T:fantasy` | Character **tag** is `fantasy` |
-| `A:Alice` | Character **author** is `Alice` |
-| `C:Bob` | Character **creator** is `Bob` |
+| `C:Bob` | Character **name** is `Bob` |
 | `space separated terms` | **AND** — all terms must match |
 | `term1, term2` | **OR** — any of the terms may match |
 | `-term` | **Negation** — the term must *not* match |
+
+Search covers character names and tags only. There is no prose search: an
+`A:` term searches names for that literal text, and any other prefix
+(`Z:`, `author:`) is treated as plain name text rather than an error.
 
 ### Examples
 
@@ -94,12 +101,11 @@ naturally and are matched against your character library.
 T:fantasy                          every character tagged "fantasy"
 T:fantasy -T:horror                fantasy, but not horror
 fantasy, sci-fi                    name contains "fantasy" OR "sci-fi"
-A:Alice T:villain                 by author Alice, tagged "villain"
-C:Bob                              created by Bob
+C:Bob T:villain                    named Bob and tagged "villain"
 fantasy T:dark                     name contains "fantasy" AND tagged "dark"
 ```
 
-`T:` and `A:`/`C:` scope the term that follows them. Prefixing a term with `-`
+`T:` and `C:` scope the term that follows them. Prefixing a term with `-`
 excludes it. Spaces mean AND and commas mean OR; use both for groups.
 
 ## Documentation

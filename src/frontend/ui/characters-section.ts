@@ -36,10 +36,10 @@
  *    shell mounts a section by releasing the outgoing one and rendering a new
  *    one), so it must NOT drop the focus intent; only a genuine abandonment of
  *    a search box does.
- * 7. **Bounded rendering.** At most {@link ROW_LIMIT} character rows and
- *    {@link TAG_OPTION_LIMIT} tag options are rendered eagerly; the rest are
- *    reported as counts, and counts always come from the store's totals rather
- *    than from the rendered page.
+ * 7. **Paged rendering.** At most {@link CHARACTER_PAGE_SIZE} character rows
+ *    and {@link TAG_OPTION_LIMIT} tag options are rendered per page, with pager
+ *    controls beneath each. Selection is GLOBAL and survives a page change;
+ *    counts always come from the store's totals rather than from the page.
  */
 
 import type {
@@ -50,19 +50,24 @@ import type {
   TagManagerStore,
 } from '../store'
 import {
+  CHARACTER_PAGE_SIZE,
   CHARACTER_SORT_LABELS,
   CHARACTER_SORT_MODES,
   CHARACTER_TAG_FILTER_LABELS,
   CHARACTER_TAG_FILTER_MODES,
+  clampPage,
+  pageCountFor,
 } from '../store'
 import { tagKey } from '../tag-index'
 import { requestDialog } from './dialog-host'
-import { avatar, button, clear, el, emptyState, field, on, sectionEl, setBusy, setDisabled, spinner, text } from './dom'
+import { avatar, button, clear, el, emptyState, field, on, pager, sectionEl, setBusy, setDisabled, spinner, text } from './dom'
 
-/** Hard cap on eagerly rendered character rows. */
-const ROW_LIMIT = 300
-
-/** Hard cap on eagerly rendered options in either tag picker. */
+/**
+ * Options rendered per page in a tag picker.
+ *
+ * A PAGE size, not a cap: the picker is paged exactly like the two lists, so
+ * every existing tag is reachable by paging rather than only by searching.
+ */
 const TAG_OPTION_LIMIT = 200
 
 /**
@@ -179,6 +184,15 @@ const pickerOpenState = new Map<string, boolean>()
  * {@link restoreSearchIntents} tried to restore a caret into it.
  */
 const pickerQueries = new Map<string, string>()
+
+/**
+ * Current page of each tag picker's OPTION list, keyed by `searchSlot`.
+ *
+ * Module scope for the same reason as {@link pickerQueries}: the panel
+ * re-renders itself on every selection change, so a renderer-scoped page would
+ * reset to 1 the moment a tag was ticked.
+ */
+const pickerPages = new Map<string, number>()
 
 /**
  * Delay before a typed search commits, in ms. Shared by the main search box and
@@ -542,6 +556,9 @@ export function renderCharactersSection(options: {
         pickerTimer = setTimeout(() => {
           pickerQueries.set(config.searchSlot, value)
           pickerOpenState.set(config.searchSlot, true)
+          // A new query reorders the options, so the old page number points at
+          // a different slice.
+          pickerPages.set(config.searchSlot, 0)
           render()
         }, SEARCH_DEBOUNCE_MS)
       },
@@ -577,8 +594,14 @@ export function renderCharactersSection(options: {
     options.setAttribute('role', 'group')
     options.setAttribute('aria-label', config.groupLabel)
 
-    const shown = Math.min(matches.length, TAG_OPTION_LIMIT)
-    for (const entry of matches.slice(0, shown)) {
+    // The picker pages its OPTIONS for the same reason the lists do. Its page is
+    // module state for the same reason `pickerQueries` is: the panel rebuilds
+    // itself on every keystroke and on every selection change, so a
+    // renderer-scoped page would snap back to 1 under the reader.
+    const pageCount = pageCountFor(matches.length, TAG_OPTION_LIMIT)
+    const page = clampPage(pickerPages.get(config.searchSlot) ?? 0, pageCount)
+
+    for (const entry of matches.slice(page * TAG_OPTION_LIMIT, (page + 1) * TAG_OPTION_LIMIT)) {
       const isOn = selected.has(entry.key)
       const line = el('div', { class: 'lt-row lt-row--wrap' })
       line.appendChild(
@@ -603,14 +626,27 @@ export function renderCharactersSection(options: {
     }
     if (matches.length > 0) body.appendChild(options)
 
-    if (matches.length > shown) {
-      // Truncation drops OPTIONS only. The search box is built above and is
-      // never inside this block, so a reader typing here keeps the rebuilt box
-      // (and their caret) however far past the cap the result set runs.
+    const optionPager = pager({
+      page,
+      pageCount,
+      total: matches.length,
+      pageSize: TAG_OPTION_LIMIT,
+      label: 'tags',
+      onPage: (next) => {
+        pickerPages.set(config.searchSlot, next)
+        render()
+      },
+    })
+    if (optionPager) body.appendChild(optionPager)
+
+    if (matches.length > page * TAG_OPTION_LIMIT && matches.length > TAG_OPTION_LIMIT) {
+      // The search box is built above and is never inside this block, so a
+      // reader typing here keeps the rebuilt box (and their caret) however far
+      // past the first page the result set runs.
       body.appendChild(
         el('p', { class: 'lt-state__detail' }, [
-          `Showing ${shown} of ${matches.length} existing tags — refine your search to see the rest. ` +
-            `${tagCountLabel(store.view.tagIndex.tags.length)} exist in total.`,
+          `${tagCountLabel(store.view.tagIndex.tags.length)} exist in total. ` +
+            'Selected tags stay ticked whichever page they are on.',
         ]),
       )
     }
@@ -971,18 +1007,23 @@ export function renderCharactersSection(options: {
     list.setAttribute('role', 'list')
     list.setAttribute('aria-label', 'Characters')
 
-    const shown = Math.min(rows.length, ROW_LIMIT)
-    for (const row of rows.slice(0, shown)) list.appendChild(renderCharacterRow(view, row))
+    // Only the current page is rendered; `characterRows` (all matches) stays in
+    // the view because Select All and the library-wide operations need it.
+    for (const row of view.characterPageRows) list.appendChild(renderCharacterRow(view, row))
 
-    if (rows.length > shown) {
-      list.appendChild(
-        el('p', { class: 'lt-state__detail' }, [
-          `Showing ${shown} of ${view.characterCount} — refine your search to see the rest.`,
-        ]),
-      )
-    } else if (view.characterCount > rows.length) {
-      // The visible page is never the whole dataset; say so rather than letting
-      // a row count be mistaken for a library count.
+    const controls = pager({
+      page: view.characterPage,
+      pageCount: view.characterPageCount,
+      total: rows.length,
+      pageSize: CHARACTER_PAGE_SIZE,
+      label: 'characters',
+      onPage: (page) => store.actions.setCharacterPage(page),
+    })
+    if (controls) list.appendChild(controls)
+
+    // Below the pager, the filtered-vs-library distinction still has to be
+    // stated: a page count says nothing about characters the search excluded.
+    if (view.characterCount > rows.length) {
       list.appendChild(
         el('p', { class: 'lt-state__detail' }, [
           `Showing ${rows.length} of ${view.characterCount} characters matching — refine your search ` +
@@ -1022,10 +1063,10 @@ export function renderCharactersSection(options: {
           ? 'Tick the tags to add or remove. Assignment is ADDITIVE: every selected character keeps ' +
             'the tags it already has, and only the tags it is missing are added. Unassignment is ' +
             'SCOPED: only the selected characters lose the ticked tags, and their other tags are ' +
-            'kept. Neither is one undoable step.'
-          : 'No characters are selected yet. Tick a character above, or use “Select All (visible ' +
-            'list only)” below, then pick the tags to add or remove. Assignment adds tags; ' +
-            'unassignment removes them from the selected characters only.',
+            'kept. Neither is one undoable step. Your selection spans every page, so what you ticked earlier still counts.'
+          : 'No characters are selected yet. Tick a character above, or use “Select All (matching ' +
+            'characters)” below, then pick the tags to add or remove. Assignment adds tags; ' +
+            'unassignment removes them from the selected characters only. Selection carries across pages.',
       ]),
     )
 
@@ -1036,6 +1077,17 @@ export function renderCharactersSection(options: {
         characterCountLabel(characterCount),
       ]),
     )
+    // Selection is global but the list is paged, so say so whenever a selection
+    // spans more than the rows on screen — otherwise the count reads as "only
+    // what is ticked right here".
+    const onThisPage = view.characterPageRows.filter((row) => row.selected).length
+    if (characterCount > onThisPage) {
+      counts.appendChild(
+        el('span', { class: 'lt-tag-row__meta' }, [
+          `(${onThisPage} of them ticked on this page)`,
+        ]),
+      )
+    }
     counts.appendChild(el('span', { class: 'lt-tag-row__meta' }, ['Selected tags:']))
     counts.appendChild(
       el('span', { class: hasTags ? 'lt-badge lt-badge--accent' : 'lt-badge lt-badge--muted' }, [
@@ -1046,11 +1098,12 @@ export function renderCharactersSection(options: {
 
     const actions = el('div', { class: 'lt-toolbar__actions' })
 
-    const selectAll = button('Select All (visible list only)', {
+    const selectAll = button('Select All (matching characters)', {
       title:
-        'Select only the characters shown by your current search, sort and filters — this does NOT ' +
-        'select every character in your library',
-      ariaLabel: 'Select all characters in the currently displayed list, not the whole library',
+        'Select every character matching your current search, sort and filters, across ALL pages — ' +
+        'not every character in your library. Tags ticked on an earlier page stay ticked.',
+      ariaLabel:
+        'Select all characters matching the current search across every page, not the whole library',
       onClick: () => store.actions.selectAllVisibleCharacters(),
     })
     setDisabled(selectAll, view.characterRows.length === 0)

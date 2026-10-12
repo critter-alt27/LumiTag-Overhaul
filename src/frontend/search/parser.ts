@@ -6,7 +6,7 @@
  *   query     := group (',' group)*
  *   group     := term (WS+ term)*
  *   term      := '-'? (prefixed | bare)
- *   prefixed  := ('T' | 'A' | 'C') ':' value   // prefix matched case-insensitively
+ *   prefixed  := ('T' | 'C') ':' value   // prefix matched case-insensitively
  *   bare      := value                          // character-name search
  *
  * - Whitespace means AND within a group.
@@ -14,9 +14,9 @@
  * - A leading `-` negates the whole predicate of the term it prefixes.
  * - Only whitespace and `,` delimit; every other character is part of the
  *   value, so `Rin & Mei`, `Sword-Art` and `a.b` survive intact.
- * - Only `T:`, `A:` and `C:` are prefixes. Anything else containing a colon
- *   (e.g. `Z:foo`) is plain text and becomes a bare name term, so ordinary
- *   search stays usable.
+ * - Only `T:` and `C:` are prefixes. Anything else containing a colon
+ *   (e.g. `Z:foo`, and the retired `A:`) is plain text and becomes a bare name
+ *   term, so ordinary search stays usable.
  *
  * Architecture: this file is strictly tokenizer + parser. Matching lives in the
  * evaluator, which consumes `ParsedQuery`.
@@ -30,7 +30,7 @@
 // ---------------------------------------------------------------------------
 
 /** Which part of a character a term targets. */
-export type TermField = 'name' | 'tag' | 'any' | 'char'
+export type TermField = 'name' | 'tag' | 'char'
 
 export interface QueryTerm {
   field: TermField
@@ -140,13 +140,12 @@ export function tokenize(input: string): { tokens: string[] } {
 // Stage 2: parsing
 // ---------------------------------------------------------------------------
 
-/** `T:`, `A:` or `C:` — matched case-insensitively, value captured verbatim. */
-const PREFIX_PATTERN = /^([TAC]):(.*)$/i
+/** `T:` or `C:` — matched case-insensitively, value captured verbatim. */
+const PREFIX_PATTERN = /^([TC]):(.*)$/i
 
 /** Canonical (upper-case) prefix spelling for each recognised prefix. */
 const PREFIX_FIELDS = {
   T: 'tag',
-  A: 'any',
   C: 'char',
 } as const satisfies Record<string, TermField>
 
@@ -154,7 +153,6 @@ const PREFIX_FIELDS = {
 const FIELD_PREFIX: Record<TermField, string> = {
   name: '',
   tag: 'T:',
-  any: 'A:',
   char: 'C:',
 }
 
