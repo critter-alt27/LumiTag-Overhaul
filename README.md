@@ -35,48 +35,6 @@ entire point of the extension — there is no unprivileged alternative.
 LumiTag requests nothing else. It does not read or write chats, prompts, presets,
 world books, or media, and it never sends your characters anywhere.
 
-## Installation
-
-1. Place the extension under your Lumiverse data directory:
-
-   ```
-   data/extensions/<your-dir>/repo/
-   ```
-
-   so that `data/extensions/<your-dir>/repo/spindle.json` exists.
-
-2. Open the **Spindle** panel → **Extensions** → **Import Local**, and select
-   that `repo` directory.
-
-3. **Enable** LumiTag, then **grant the `characters` permission** when prompted.
-   An admin approval is required.
-
-4. Open the **Tag Manager** tab in the drawer sidebar.
-
-> LumiTag is a full-stack extension: it ships a frontend bundle **and** a backend
-> worker. If `dist/backend.js` is missing the extension cannot read characters and
-> the catalog will stay empty.
-
-## Building from source
-
-From the `LumiTag/` directory:
-
-```bash
-bun install          # only needed if you are building outside the Lumiverse repo
-
-bun run build:backend    # bun build src/backend.ts  --outfile dist/backend.js  --target bun
-bun run build:frontend   # bun build src/frontend.ts --outfile dist/frontend.js --target browser
-bun run build            # both
-
-bun run typecheck        # tsc --noEmit
-bun test                 # unit tests
-```
-
-Inside the Lumiverse repository you do **not** need to run `bun install` —
-`node_modules` resolves from the repository root upward.
-
-The host builds these bundles automatically when `dist/` is missing.
-
 ## Search syntax
 
 The Tag Manager query bar accepts a compact filter language. Terms combine
