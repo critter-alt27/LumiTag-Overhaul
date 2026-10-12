@@ -146,6 +146,21 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     if (destroyed) return
     const view = store.view
 
+    // Remember focus on the two primary search fields before the shell replaces
+    // the DOM. Section-level restoration handles many cases, but the shell owns
+    // the actual detach/rebuild and can reliably restore focus after the new
+    // section is attached.
+    const active = root.ownerDocument.activeElement
+    const activeSearch = active instanceof HTMLInputElement && (
+      (view.section === 'tags' && active.matches('input.lt-search')) ||
+      (view.section === 'characters' && active.matches('input[data-lt-search="characters"]'))
+    ) ? {
+      selector: view.section === 'tags' ? 'input.lt-search' : 'input[data-lt-search="characters"]',
+      start: active.selectionStart ?? active.value.length,
+      end: active.selectionEnd ?? active.value.length,
+      direction: active.selectionDirection ?? 'none',
+    } : null
+
     // Skip a no-op re-render. `commit()` only bumps the version on a real
     // change, so this is exact rather than a heuristic.
     if (store.version === lastVersion) return
@@ -213,6 +228,24 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
         }
       } else {
         restoreScroll(previousTop, sectionHost)
+      }
+    }
+
+    // Restore only if the same section is still active. This prevents a search
+    // commit from stealing focus back after the user switches tabs.
+    if (activeSearch && !switchedSection) {
+      const input = root.querySelector(activeSearch.selector)
+      if (input instanceof HTMLInputElement) {
+        input.focus()
+        try {
+          input.setSelectionRange(
+            Math.min(activeSearch.start, input.value.length),
+            Math.min(activeSearch.end, input.value.length),
+            activeSearch.direction,
+          )
+        } catch {
+          // Selection APIs are not supported by every input implementation.
+        }
       }
     }
   }

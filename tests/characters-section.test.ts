@@ -444,7 +444,7 @@ function type(search: HTMLInputElementStub, value: string, caret: number): void 
 }
 
 /**
- * Type into a PICKER box and let its 1000ms debounce fire.
+ * Type into a PICKER box and let its debounce fire.
  *
  * A picker's query is view state the panel re-renders itself on, so this is the
  * real commit path for those slots — no shell rebuild involved.
@@ -459,7 +459,7 @@ function typeIntoPickerAndCommit(
   search.setSelectionRange(caret, caret)
   search.dispatch('input')
   // The REAL debounce, not a literal: a hardcoded 1000 here outlived the
-  // source's move to 1500 and left these tests asserting against a rebuild
+  // source's debounce change and left these tests asserting against a rebuild
   // that never happened.
   jest.advanceTimersByTime(SEARCH_DEBOUNCE_MS)
   jest.useRealTimers()
