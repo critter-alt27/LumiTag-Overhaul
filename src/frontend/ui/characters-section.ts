@@ -409,7 +409,7 @@ export function renderCharactersSection(options: {
   const renderToolbar = (view: StoreView): HTMLElement => {
     const bar = el('div', { class: 'lt-toolbar', role: 'toolbar', 'aria-label': 'Character actions' })
 
-    const search = buildSearch('characters', 'Search characters and their tags', view.characterQuery, (value) => {
+    const search = buildSearch('characters', 'Search characters & tags', view.characterQuery, (value) => {
       if (searchTimer) clearTimeout(searchTimer)
       searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), SEARCH_DEBOUNCE_MS)
     })
@@ -1098,7 +1098,7 @@ export function renderCharactersSection(options: {
 
     const actions = el('div', { class: 'lt-toolbar__actions' })
 
-    const selectAll = button('Select All (matching characters)', {
+    const selectAll = button('Select All (matching)', {
       title:
         'Select every character matching your current search, sort and filters, across ALL pages — ' +
         'not every character in your library. Tags ticked on an earlier page stay ticked.',

@@ -191,8 +191,8 @@ export function renderTagsSection(options: {
     const input = el('input', {
       class: 'lt-search',
       type: 'search',
-      'aria-label': 'Search tags with T:, character fields with A:, or character names with C:.',
-      placeholder: 'Search tags (T:tag, A:fields, C:character)',
+      'aria-label': 'Search tags with T:, or character names with C:.',
+      placeholder: 'Search tags (T:tag, C:char)',
       autocomplete: 'off',
       autocapitalize: 'none',
       spellcheck: 'false',
