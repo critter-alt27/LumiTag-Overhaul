@@ -199,11 +199,11 @@ const pickerPages = new Map<string, number>()
  * every tag picker.
  *
  * Exported so the tests can advance the fake clock by the REAL value: this
- * constant was changed once (1000 → 1500) without the tests following, and the
+ * constant was changed before without the tests following, and the
  * picker-rebuild tests then silently stopped rebuilding anything while still
  * looking like ordinary focus assertions.
  */
-export const SEARCH_DEBOUNCE_MS = 1500
+export const SEARCH_DEBOUNCE_MS = 250
 
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 let pickerTimer: ReturnType<typeof setTimeout> | null = null
