@@ -256,6 +256,14 @@ export const LUMITAG_CSS = `
   padding: 0 12px calc(12px + env(safe-area-inset-bottom, 0px));
 }
 
+/* The empty 'No failures' state sits directly below the sticky pager. Its
+   generic 24px vertical padding creates an oversized visual gap in this docked
+   region, so compact only the state rendered inside the failure dock. */
+.lt-app__failure-region > .lt-state {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
 /* ================================================================== */
 /* 4. Navigation — segmented control (Tags / Characters)          */
 /* ================================================================== */
