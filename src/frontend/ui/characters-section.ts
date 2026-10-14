@@ -544,7 +544,7 @@ export function renderCharactersSection(options: {
         select(FILTER_OPTIONS, view.characterTagFilter, (value) =>
           store.actions.setCharacterTagFilter(value),
         ),
-        '“"",
+        '',
       ),
     )
 
