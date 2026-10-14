@@ -1,8 +1,8 @@
 {
   "version": "0.1.1",
-  "name": "LumiTag — Lumiverse Tag Manager",
-  "identifier": "lumitag",
-  "author": "LumiTag",
+  "name": "LumiTag",
+  "identifier": "lumi-tag",
+  "author": "Critter",
   "github": "https://github.com/interesting-critter/LumiTag",
   "homepage": "https://github.com/interesting-critter/LumiTag",
   "description": "Dedicated tag manager for Lumiverse characters: derived tag catalog, create/rename/merge/delete, bulk operations, advanced query language, and per-character partial-failure reporting with safe retry.",
