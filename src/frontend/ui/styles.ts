@@ -759,15 +759,19 @@ export const LUMITAG_CSS = `
   right: 8px;
   top: 50%;
   transform: translateY(-50%);
-  display: flex;
+  display: block;
+  width: 14px;
+  height: 14px;
   pointer-events: none;
   color: var(--lumiverse-text-muted, var(--lumiverse-text, CanvasText));
 }
 
-.lt-selectfield__chevron svg {
-  display: block;
-  width: 12px;
-  height: 12px;
+/* The chevron helper is the SVG itself (not a wrapper around an SVG). */
+.lt-selectfield > .lt-selectfield__chevron {
+  width: 14px;
+  height: 14px;
+  max-width: 14px;
+  max-height: 14px;
 }
 
 /*
@@ -1409,8 +1413,8 @@ export const LUMITAG_CSS = `
   align-items: center;
   justify-content: space-between;
   gap: 8px 12px;
-  margin-top: 4px;
-  padding: 6px 0;
+  margin-top: 0;
+  padding: 2px 0;
   font-size: calc(11px * var(--lumiverse-font-scale, 1));
   color: var(--lumiverse-text-hint, var(--lumiverse-text-dim, CanvasText));
   background: var(--lumiverse-bg-deep, var(--lumiverse-bg, Canvas));
