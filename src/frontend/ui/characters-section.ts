@@ -544,8 +544,7 @@ export function renderCharactersSection(options: {
         select(FILTER_OPTIONS, view.characterTagFilter, (value) =>
           store.actions.setCharacterTagFilter(value),
         ),
-        '“Has ANY of these tags” matches a character carrying at least one of the picked tags; ' +
-          '“Has ALL of these tags” requires every one of them',
+        '“"",
       ),
     )
 
@@ -812,11 +811,8 @@ export function renderCharactersSection(options: {
     const node = renderTagPicker({
       title: used ? 'Tags this filter applies to' : 'Tags for the ANY / ALL filters',
       description: used
-        ? `The current filter “${CHARACTER_TAG_FILTER_LABELS[view.characterTagFilter]}” is applied to the ` +
-          `${view.activeFilterTagKeys.length} ${view.activeFilterTagKeys.length === 1 ? 'tag' : 'tags'} picked below. ` +
-          'With none picked, every character matches this filter.'
-        : `The current filter “${CHARACTER_TAG_FILTER_LABELS[view.characterTagFilter]}” ignores this selection. ` +
-          'It starts to apply as soon as you choose “Has ANY of these tags” or “Has ALL of these tags”.',
+        ? ``
+        : ``,
       searchSlot: 'active-filter-tags',
       searchLabel: 'Search existing tags to add to the filter',
       searchValue: pickerQueries.get('active-filter-tags') ?? '',
@@ -1175,13 +1171,8 @@ export function renderCharactersSection(options: {
     banner.appendChild(
       el('span', {}, [
         hasCharacters
-          ? 'Tick the tags to add or remove. Assignment is ADDITIVE: every selected character keeps ' +
-            'the tags it already has, and only the tags it is missing are added. Unassignment is ' +
-            'SCOPED: only the selected characters lose the ticked tags, and their other tags are ' +
-            'kept. Neither is one undoable step. Your selection spans every page, so what you ticked earlier still counts.'
-          : 'No characters are selected yet. Tick a character above, or use “Select All (matching ' +
-            'characters)” below, then pick the tags to add or remove. Assignment adds tags; ' +
-            'unassignment removes them from the selected characters only. Selection carries across pages.',
+          ? ''
+          : '',
       ]),
     )
 
@@ -1271,9 +1262,7 @@ export function renderCharactersSection(options: {
     const picker = renderTagPicker({
       title: 'Tags to assign or unassign',
       description:
-        'Only tags that already exist can be picked. Characters that already carry a chosen tag ' +
-        'are left untouched by an assignment, and characters that do not carry one are left ' +
-        'untouched by an unassignment, so re-running either changes nothing.',
+        'Only tags that already exist can be picked. Characters that already carry a chosen tag ',
       searchSlot: 'assign-tags',
       searchLabel: 'Search existing tags to assign',
       searchValue: pickerQueries.get('assign-tags') ?? '',
