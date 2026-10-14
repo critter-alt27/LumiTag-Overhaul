@@ -2065,7 +2065,29 @@ export const LUMITAG_CSS = `
 
   /* Pagination keeps clear navigation; only the range line may wrap. */
   .lt-pager { flex-wrap: wrap; }
-  .lt-pager__status { white-space: normal; }
+ /*
+ * Keep the pager docked at the bottom of the scroll area when a page has fewer
+ * rows than the available height. The body itself fills the space above the
+ * failure region; without a growing section/list, the pager stays after the
+ * last row and leaves a large blank band below it.
+ */
+.lt-app__body > .lt-box:has(.lt-pager) {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+}
+
+.lt-app__body > .lt-box:has(.lt-pager) > .lt-list:has(> .lt-pager) {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+}
+
+.lt-app__body > .lt-box:has(.lt-pager) > .lt-list > .lt-pager {
+  margin-top: auto;
+}
+
+ .lt-pager__status { white-space: normal; }
   .lt-pager__actions { margin-left: 0; }
 }
 
