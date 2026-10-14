@@ -254,6 +254,15 @@ async function requestConfirm(
   options: { variant?: ConfirmOptions['variant']; confirmLabel?: string } = {},
 ): Promise<boolean> {
   if (typeof host.confirm === 'function') {
+    // The extension overlay sits above the host's own confirmation layer. Hide
+    // existing extension dialogs while the host confirmation is open, otherwise
+    // the review dialog can visually cover and block the confirmation underneath.
+    // Preserve each overlay's prior inline visibility and restore it after the
+    // host confirmation resolves (including cancel/error paths).
+    const portal = portalParent(host.root)
+    const overlays = [...portal.querySelectorAll<HTMLElement>('.lt-dialog-overlay')]
+    const priorVisibility = overlays.map((overlay) => [overlay, overlay.style.visibility] as const)
+    for (const overlay of overlays) overlay.style.visibility = 'hidden'
     try {
       const answer = await host.confirm({
         title,
@@ -265,6 +274,10 @@ async function requestConfirm(
     } catch {
       // A throwing host confirm must never become an accidental approval.
       return false
+    } finally {
+      for (const [overlay, visibility] of priorVisibility) {
+        if (overlay.isConnected) overlay.style.visibility = visibility
+      }
     }
   }
 
