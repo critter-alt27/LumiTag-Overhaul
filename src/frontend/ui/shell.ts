@@ -142,14 +142,32 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     body.scrollTop = Math.max(0, clamped)
   }
 
+  /**
+   * Rebuild the whole panel.
+   *
+   * ------------------------------------------------------------------
+   * LOAD-BEARING: four protections below keep typing and scrolling stable
+   * across a rebuild that throws the entire DOM away. They are heavily tested
+   * behaviour, not incidental code, and a visual restyle must not reorder,
+   * merge or "simplify" them:
+   *
+   *   1. FOCUS CAPTURE (step 1) + FOCUS RESTORE (step 9) — the reader must not
+   *      lose focus or their caret when a search commit rebuilds the panel.
+   *   2. SCROLL CAPTURE (step 3) + SCROLL RESTORE (step 7), including the
+   *      "never jump downward" guard and the clamping helper.
+   *   3. THE TAB-SWITCH SKIP (step 4) — a section switch deliberately discards
+   *      the previous offset and does not restore focus.
+   *   4. THE NO-OP SKIP (step 2) — `store.version` gates every rebuild.
+   * ------------------------------------------------------------------
+   */
   const render = (): void => {
     if (destroyed) return
     const view = store.view
 
-    // Remember focus on the two primary search fields before the shell replaces
-    // the DOM. Section-level restoration handles many cases, but the shell owns
-    // the actual detach/rebuild and can reliably restore focus after the new
-    // section is attached.
+    // (1) Remember focus on the two primary search fields before the shell
+    // replaces the DOM. Section-level restoration handles many cases, but the
+    // shell owns the actual detach/rebuild and can reliably restore focus after
+    // the new section is attached.
     const active = root.ownerDocument.activeElement
     const activeSearch = active instanceof HTMLInputElement && (
       (view.section === 'tags' && active.matches('input.lt-search')) ||
@@ -161,14 +179,16 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
       direction: active.selectionDirection ?? 'none',
     } : null
 
-    // Skip a no-op re-render. `commit()` only bumps the version on a real
+    // (4) Skip a no-op re-render. `commit()` only bumps the version on a real
     // change, so this is exact rather than a heuristic.
     if (store.version === lastVersion) return
     lastVersion = store.version
 
-    // Read the offset off the PREVIOUS render's body, before `clear()` throws
+    // (2) Read the offset off the PREVIOUS render's body, before `clear()` throws
     // that element away: the replacement starts life at 0 and there is no
-    // browser-level memory of where the user was.
+    // browser-level memory of where the user was. The anchor is the first
+    // row-ish element of the OLD body; its distance from the viewport top is
+    // what lets the new body put that same element back under the same pixels.
     const previousTop = sectionHost !== null ? sectionHost.scrollTop : 0
     let previousAnchorOffset = 0
     if (sectionHost !== null) {
@@ -182,7 +202,7 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
       }
     }
 
-    // Switching tabs replaces the content wholesale with something unrelated,
+    // (3) Switching tabs replaces the content wholesale with something unrelated,
     // so the offset from the previous tab is meaningless there and the new tab
     // should start at its own top. Every OTHER re-render — filtering, sorting,
     // expanding, selecting in bulk/merge mode — keeps the offset.
@@ -193,9 +213,15 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     clear(root)
 
     // root (tab.root) already carries .lt-app from app.ts; don't nest.
+    //
+    // Hierarchy (overhaul.txt §4): a compact panel heading carrying the status it
+    // genuinely has, then the Tags/Characters navigation, then the section —
+    // which owns search, sorting, actions, results and pagination — and finally
+    // the docked failure region. Search deliberately stays inside the sections:
+    // each one owns its own focus/caret intent and debounce timer, and hoisting
+    // the input up here would strand both.
     root.appendChild(renderHeader(view))
-    root.appendChild(renderTabs(view))
-    root.appendChild(renderMeta(view))
+    root.appendChild(renderNav(view))
 
     sectionHost = el('div', { class: 'lt-app__body' })
     root.appendChild(sectionHost)
@@ -205,8 +231,11 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     root.appendChild(failureHost)
     options.renderFailurePanel(failureHost)
 
-    // The body is populated and attached now, so `scrollHeight` is meaningful
-    // and the clamp can be computed rather than guessed.
+    // (2) The body is populated and attached now, so `scrollHeight` is meaningful
+    // and the clamp can be computed rather than guessed. The `computed <=
+    // previousTop` guard is what makes restoration one-directional: content that
+    // grew ABOVE the fold (a row opening, a filter clearing) must never yank the
+    // reader further down the list.
     if (!switchedSection && sectionHost !== null) {
       const newAnchorSelectors = ['.lt-tag-row', '.lt-state', '.lt-box', '.lt-character-row']
       let newAnchorTop = 0
@@ -231,7 +260,7 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
       }
     }
 
-    // Restore only if the same section is still active. This prevents a search
+    // (1) Restore only if the same section is still active. This prevents a search
     // commit from stealing focus back after the user switches tabs.
     if (activeSearch && !switchedSection) {
       const input = root.querySelector(activeSearch.selector)
@@ -250,21 +279,36 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     }
   }
 
+  /**
+   * The panel header: a compact heading, the operational status it genuinely
+   * carries, and the two controls that belong to the panel rather than to a
+   * section.
+   *
+   * Nothing was removed to make it smaller — the counts and the last-refresh
+   * time are still here — they are just demoted to one muted line under the
+   * heading (overhaul.txt §3A).
+   */
   const renderHeader = (view: StoreView): HTMLElement => {
     const header = el('div', { class: 'lt-app__header' })
 
-    header.appendChild(el('h2', { class: 'lt-app__title' }, ['LumiTag']))
+    const heading = el('div', { class: 'lt-app__heading' })
+    heading.appendChild(el('h2', { class: 'lt-app__title' }, ['LumiTag']))
+    header.appendChild(heading)
 
-    header.appendChild(
+    header.appendChild(el('span', { class: 'lt-app__spacer' }))
+    header.appendChild(renderMeta(view))
+
+    const actions = el('div', { class: 'lt-app__actions' })
+    // Search help stays a first-class header control rather than being buried in
+    // a section toolbar, so it is reachable from either view (and it opens the
+    // section the reader is actually in).
+    actions.appendChild(
       button('Search Syntax Help', {
         variant: 'ghost',
-        ariaLabel: 'Show search syntax help',
         title: 'Show the search syntax accepted in this section',
         onClick: () => options.onShowSearchHelp(view.section),
       }),
     )
-
-    header.appendChild(el('span', { class: 'lt-app__spacer' }))
 
     const refresh = button('Refresh', {
       variant: 'default',
@@ -276,13 +320,31 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     // Disabled while a load is in flight so a double click cannot start two
     // full-library walks.
     setBusy(refresh, view.loadState === 'loading' || view.isRefreshing, 'Refreshing…')
-    header.appendChild(refresh)
+    actions.appendChild(refresh)
+    header.appendChild(actions)
+
     refreshButton = refresh
     void refreshButton
 
     return header
   }
 
+  /** The navigation row that holds the Tags/Characters segmented control. */
+  const renderNav = (view: StoreView): HTMLElement => {
+    const nav = el('div', { class: 'lt-app__nav' })
+    nav.appendChild(renderTabs(view))
+    return nav
+  }
+
+  /**
+   * The Tags/Characters switcher, styled as the host's segmented control
+   * (SettingsModal.module.css:696-731) — a rounded, subtle-filled, hairline
+   * row with 1px dividers and a `--primary-020` active cell, rather than the
+   * large saturated rectangle the previous stylesheet produced.
+   *
+   * Each cell carries its own count in a `.lt-tabs__count` badge, which is the
+   * host's own way of showing scope in a tab rail.
+   */
   const renderTabs = (view: StoreView): HTMLElement => {
     const strip = el('div', { class: 'lt-tabs', role: 'tablist' })
     strip.setAttribute('aria-label', 'LumiTag sections')
@@ -299,6 +361,16 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
       tab.setAttribute('role', 'tab')
       tab.setAttribute('aria-selected', isActive ? 'true' : 'false')
       tab.tabIndex = isActive ? 0 : -1
+
+      const count = section.id === 'tags'
+        ? view.tagIndex.tags.length
+        : view.characterCount
+      // The badge is decorative: the tab's accessible name already says which
+      // section it is, and the counts are repeated in the header status line.
+      tab.appendChild(el('span', { class: 'lt-tabs__count', 'aria-hidden': 'true' }, [
+        String(count),
+      ]))
+
       strip.appendChild(tab)
       tabButtons.push(tab)
     }
@@ -339,19 +411,23 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     return strip
   }
 
+  /** One muted line: how much is loaded, how much is untagged, and how fresh. */
   const renderMeta = (view: StoreView): HTMLElement => {
     const meta = el('div', { class: 'lt-app__meta' })
-    const total = view.characterCount
     meta.appendChild(
       el('span', {}, [
-        text(countLabel(total, 'character')),
+        text(countLabel(view.tagIndex.tags.length, 'tag')),
         text(' · '),
-        el('strong', {}, [`${view.tagIndex.tags.length} tags`]),
+        text(countLabel(view.characterCount, 'character')),
       ]),
     )
-    meta.appendChild(el('span', {}, [text(`${countLabel(view.untaggedCount, 'untagged character')}`)]))
     meta.appendChild(
-      el('span', {}, [text(`Last refreshed: ${formatTime(view.lastRefreshedAt)}`)]),
+      el('span', {}, [text(`${countLabel(view.untaggedCount, 'untagged character')}`)]),
+    )
+    meta.appendChild(
+      el('span', { class: 'lt-app__meta-time' }, [
+        text(`Last refreshed ${formatTime(view.lastRefreshedAt)}`),
+      ]),
     )
 
     return meta

@@ -1,9 +1,10 @@
 /**
  * LumiTag "Tags" section renderer.
  *
- * Owns the toolbar (search, sort, mode toggles, create), the query-error
- * notice, the `C:` character-search panel, the ordinary tag list with its
- * expandable character sub-list, and the bulk-delete / merge mode toolbars.
+ * Owns the compact context line, the toolbar (search, sort, create, mode
+ * toggles), the query-error notice, the `C:` character-search panel, the
+ * ordinary tag list with its expandable character sub-list, and the
+ * bulk-delete / merge mode banners.
  *
  * ## Rules this renderer obeys
  *
@@ -18,10 +19,11 @@
  *     a row or renaming a tag cannot corrupt a selection.
  *  4. **Every listener is disposable.** Listeners are attached only through
  *     `on()` and their disposers are tracked, so `destroy()` releases all of
- *     them. The controls that `dom.ts` builds with its own listeners
- *     (`searchInput`, `select`, `checkbox`, `chip`) are therefore NOT used
- *     here; equivalent controls are built below from `el` + tracked `on` so
- *     that nothing outlives the render.
+ *     them. `dom.select()` is the one `dom.ts` builder used here: its listener
+ *     is registered against the node it owns, so `dom.clear()` — which both the
+ *     re-render path and `destroy()` call — releases it with the node. The
+ *     search box is built below from `el` + tracked `on` because it also owns
+ *     the focus/caret listeners that must survive a rebuild.
  *  5. **Re-rendering is the shell's job.** `renderShell` clears and rebuilds
  *     the section on every store change, so this renderer does not subscribe
  *     to the store itself (a second subscription would leak one listener per
@@ -29,6 +31,18 @@
  *  6. **Paged rendering.** At most {@link TAG_PAGE_SIZE} rows are rendered per
  *     page so a huge catalog cannot freeze the drawer. Tag selection is GLOBAL
  *     and survives a page change; counts always come from the store.
+ *
+ * ## Visual contract (overhaul.txt §3B, §3E, §3F, §3G, §4)
+ *
+ * The section reads top-down as: a compact context line (how much is here, how
+ * much the query left), the search field, the sort control, the actions, then
+ * the rows, then the pager — the same ladder the Characters section uses, so
+ * the two read as two views of one feature rather than as two utilities. Rows
+ * are hairline-separated rather than carded (`.lt-tag-row`), the disclosure
+ * control is a square icon button at the head of the row and the row-level
+ * actions are quiet text buttons at its tail, and row-level Delete is
+ * `danger-ghost` so ordinary browsing stays calm while a destructive action is
+ * still recognisable.
  */
 
 import {
@@ -41,13 +55,24 @@ import {
 import { charactersForTag } from '../tag-index'
 import { TAG_SORT_LABELS, TAG_SORT_MODES } from '../tag-sorting'
 import type { TagSortMode } from '../tag-sorting'
+import { SEARCH_DEBOUNCE_MS } from './characters-section'
 import { requestDialog } from './dialog-host'
-import { avatar, button, clear, el, emptyState, field, on, pager, sectionEl, spinner, text } from './dom'
-
-/**
- * Per-page row cap for the Tags list. The rows themselves come from
- * `view.tagPageRows`, which the store already sliced.
- */
+import {
+  avatar,
+  badge,
+  button,
+  clear,
+  el,
+  emptyState,
+  field,
+  on,
+  pager,
+  sectionEl,
+  select,
+  setDisabled,
+  spinner,
+  text,
+} from './dom'
 
 /** Hard cap on eagerly rendered characters in any one sub-list. */
 const CHARACTER_LIMIT = 200
@@ -98,7 +123,12 @@ let searchFocusIntent = false
  */
 let searchCaret = 0
 
-/** Pending debounce for the 250ms search commit. Survives a re-render on purpose. */
+/**
+ * Pending debounce for the search commit.
+ *
+ * Deliberately NOT cleared on teardown: the commit has to outlive the rebuild
+ * that the debounce itself causes, or typing would never commit at all.
+ */
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 
 /** Session-authenticated, read-only avatar endpoint for a character. */
@@ -160,38 +190,24 @@ export function renderTagsSection(options: {
   // Tracked control builders (see rule 4 at the top of the file)
   // ---------------------------------------------------------------------
 
-  const buildCheckbox = (
-    checked: boolean,
-    ariaLabel: string,
-    onChange: (checked: boolean) => void,
-  ): HTMLInputElement => {
-    const input = el('input', { class: 'lt-checkbox', type: 'checkbox', 'aria-label': ariaLabel })
-    input.checked = checked
-    track(on(input, 'change', () => onChange(input.checked)))
-    return input
-  }
-
-  const buildSelect = (value: TagSortMode, onChange: (v: TagSortMode) => void): HTMLSelectElement => {
-    const node = el('select', { class: 'lt-select', 'aria-label': 'Sort tags by' })
-    for (const option of SORT_OPTIONS) {
-      node.appendChild(el('option', { value: option.value }, [option.label]))
-    }
-    node.value = value
-    track(
-      on(node, 'change', () => {
-        const next = node.value as TagSortMode
-        // An unknown value can only come from a stale DOM; ignore it.
-        if (SORT_OPTIONS.some((o) => o.value === next)) onChange(next)
-      }),
-    )
-    return node
-  }
-
-  const buildSearch = (value: string, onInput: (v: string) => void): HTMLInputElement => {
+  /**
+   * The primary search box: the host `SearchField` structure
+   * (SearchField.module.css:1-27) — a subtle-filled hairline pill with a
+   * borderless 13px input and its own clear control.
+   *
+   * The pill is assembled here rather than through `dom.searchInput()` because
+   * the pill's extra listeners (clear-click, clear-visibility) have to sit in
+   * this renderer's disposer set alongside the focus/caret listeners, which is
+   * what lets the test suite prove that `destroy()` releases all of them. The
+   * resulting class names — `.lt-searchfield`, `.lt-searchfield__input`,
+   * `.lt-searchfield__clear` — are the contract with `styles.ts` §6.
+   */
+  const buildSearch = (value: string, onInput: (v: string) => void): HTMLElement => {
+    const ariaLabel = 'Search tags with T:, or character names with C:.'
     const input = el('input', {
-      class: 'lt-search',
+      class: 'lt-search lt-searchfield__input',
       type: 'search',
-      'aria-label': 'Search tags with T:, or character names with C:.',
+      'aria-label': ariaLabel,
       placeholder: 'Search tags (T:tag, C:char)',
       autocomplete: 'off',
       autocapitalize: 'none',
@@ -209,9 +225,7 @@ export function renderTagsSection(options: {
         // A detached node also blurs, and the shell detaches this input on
         // every rebuild, so a blur from a node that has left the document is
         // the panel being replaced — not the reader moving on — and the intent
-        // must outlive it. (Within this renderer `teardown()` always runs
-        // before the detach, so this guard only ever sees host-driven teardown;
-        // it is kept because that case has no other writer.)
+        // must outlive it.
         if (input.isConnected) searchFocusIntent = false
       }),
     )
@@ -222,22 +236,121 @@ export function renderTagsSection(options: {
     }
     track(on(input, 'keyup', recordCaret))
     track(on(input, 'select', recordCaret))
-    return input
+
+    // The host draws its own clear control and hides the UA one
+    // (SearchField.module.css:22), so it is visible only while there is
+    // something to clear. Icon-only ⇒ it carries both a name and a tooltip.
+    const clearLabel = 'Clear the tag search'
+    const clearBtn = button('×', { variant: 'icon-sm', ariaLabel: clearLabel, title: clearLabel })
+    clearBtn.setAttribute('class', 'lt-btn lt-btn--icon-sm lt-searchfield__clear')
+    clearBtn.hidden = value === ''
+    track(
+      on(clearBtn, 'click', () => {
+        input.value = ''
+        clearBtn.hidden = true
+        onInput('')
+        // Clearing must leave the reader typing in the same box, not send them
+        // back to the top of the panel.
+        input.focus()
+      }),
+    )
+    track(
+      on(input, 'input', () => {
+        clearBtn.hidden = input.value === ''
+      }),
+    )
+
+    // The wrapper IS the pill: `.lt-searchfield` supplies the host's row layout
+    // (row direction, 8px gap, 8px 12px padding, 10px radius, `--fill-subtle`,
+    // hairline, `:focus-within` border) and its `> .lt-search` rule makes the
+    // input borderless inside it. A `.lt-field` wrapper would be the wrong
+    // choice here — `styles.ts` §6 would paint a SECOND pill around this one.
+    // `lt-toolbar__search` is applied so the field is the flexing item directly
+    // inside the toolbar (the 240px basis and the narrow-drawer full row).
+    const wrapper = el('label', { class: 'lt-searchfield lt-toolbar__search' })
+    wrapper.appendChild(input)
+    wrapper.appendChild(clearBtn)
+    return wrapper
+  }
+
+  // ---------------------------------------------------------------------
+  // Context line — the section's "useful status" (overhaul.txt §4)
+  // ---------------------------------------------------------------------
+
+  /**
+   * One compact line above the toolbar: what this list is, how much of it the
+   * current query and sort left, and — in a selection mode — how much is
+   * selected.
+   *
+   * Deliberately NOT a `.lt-state`: that class is the empty/loading treatment
+   * (centred, italic, padded) and it is also one of the shell's scroll-anchor
+   * selectors, so a status line must not borrow it.
+   */
+  const renderContext = (view: StoreView): HTMLElement => {
+    const bar = el('div', { class: 'lt-row lt-row--wrap' })
+    bar.appendChild(el('span', { class: 'lt-tag-row__name' }, ['Tags']))
+
+    const total = view.tagIndex.tags.length
+    const matching = view.tagRows.length
+
+    if (view.tagQueryIsCharacterMode) {
+      // In `C:` mode the tag list is deliberately not rendered, so a "0 of N
+      // tags" count would be true and actively misleading. Say what is on
+      // screen instead.
+      const shown = Math.min(view.tagQueryCharacters.length, CHARACTER_LIMIT)
+      bar.appendChild(
+        badge(
+          shown === 1 ? '1 matching character' : `${shown} matching characters`,
+          { title: 'Characters matched by the C: part of the query' },
+        ),
+      )
+    } else {
+      bar.appendChild(
+        badge(
+          matching === total
+            ? tagCountLabel(total)
+            : `${tagCountLabel(matching)} of ${tagCountLabel(total)}`,
+          { title: 'How many tags the current search, sort and filters leave' },
+        ),
+      )
+      if (matching === total && total > 0) {
+        bar.appendChild(
+          el('span', { class: 'lt-tag-row__meta' }, [characterCountLabel(view.characterCount) + ' to tag']),
+        )
+      }
+    }
+    if (view.tagMode !== 'normal' && view.selectedTagCount > 0) {
+      bar.appendChild(
+        badge(tagCountLabel(view.selectedTagCount), {
+          tone: 'accent',
+          title: 'Tags selected for the current mode',
+        }),
+      )
+    }
+    return bar
   }
 
   // ---------------------------------------------------------------------
   // Toolbar
   // ---------------------------------------------------------------------
 
-  const renderToolbar = (view: StoreView): HTMLElement => {
+  const renderToolbar = (view: StoreView, search: HTMLElement): HTMLElement => {
     const bar = el('div', { class: 'lt-toolbar', role: 'toolbar', 'aria-label': 'Tag actions' })
 
-    const sort = buildSelect(view.tagSort, (value) => store.actions.setTagSort(value))
-    bar.appendChild(
-      field('Sort by', sort, '“Only 0 Characters” lists tags nothing is assigned to'),
-    )
+    bar.appendChild(search)
 
     bar.appendChild(
+      field(
+        'Sort by',
+        select(SORT_OPTIONS, view.tagSort, (value) => store.actions.setTagSort(value)),
+        '“Only 0 Characters” lists tags nothing is assigned to',
+      ),
+    )
+
+    const actions = el('div', { class: 'lt-toolbar__actions' })
+
+    // The one primary action of this view. Everything else stays quiet.
+    actions.appendChild(
       button('Create Tag', {
         variant: 'primary',
         title: 'Create a new tag and assign it to characters',
@@ -245,11 +358,13 @@ export function renderTagsSection(options: {
       }),
     )
 
-    const actions = el('div', { class: 'lt-toolbar__actions' })
     for (const entry of MODE_BUTTONS) {
       const active = view.tagMode === entry.mode
       const toggle = button(active ? `${entry.label}: On` : `${entry.label}: Off`, {
-        variant: active ? 'primary' : 'ghost',
+        // Active reads as a pressed secondary, never as a second primary: two
+        // filled buttons in one toolbar is exactly the hierarchy §3C warns
+        // against.
+        variant: active ? 'default' : 'ghost',
         title: entry.title,
         ariaLabel: `${entry.label} toggle`,
         onClick: () => store.actions.setTagMode(active ? 'normal' : entry.mode),
@@ -260,10 +375,8 @@ export function renderTagsSection(options: {
       actions.appendChild(toggle)
     }
 
-    bar.appendChild(actions)
-
     if (view.tagMode !== 'normal') {
-      bar.appendChild(
+      actions.appendChild(
         button('Exit mode', {
           variant: 'ghost',
           title: 'Leave the current tag mode and return to browsing',
@@ -272,6 +385,7 @@ export function renderTagsSection(options: {
       )
     }
 
+    bar.appendChild(actions)
     return bar
   }
 
@@ -332,13 +446,22 @@ export function renderTagsSection(options: {
   // `C:` character-search mode
   // ---------------------------------------------------------------------
 
+  /**
+   * The panel shown when the query is in `C:` mode.
+   *
+   * It carries `lt-tags-section__character-mode`, whose four non-colour cues
+   * (dashed accent rail, monospace `C:` heading, tinted surface, legend line)
+   * are what stop a character-name result set from being read as a tag list.
+   * The tag list is deliberately NOT rendered alongside it — see `render()`.
+   */
   const renderCharacterMode = (view: StoreView): HTMLElement => {
-    const panel = sectionEl('lt-box lt-query-errors')
-    panel.appendChild(el('p', { class: 'lt-state__title' }, ['Character search mode (C:)']))
+    const panel = el('div', { class: 'lt-box lt-tags-section__character-mode' })
+    panel.appendChild(el('p', { class: 'lt-state__title' }, ['C: character search']))
     panel.appendChild(
       el('p', { class: 'lt-state__detail' }, [
-        'A: searches character fields and C: searches character names. The characters below matched ' +
-          'your character query, with the tags they currently carry. Use T: to search exact tag names.',
+        'C: matches characters by NAME, not by tag. The characters below are the ones your ' +
+          'character query matched, with the tags they currently carry. Drop the C: prefix to ' +
+          'search tag names instead; an unknown prefix like A: is treated as plain name text.',
       ]),
     )
 
@@ -347,8 +470,8 @@ export function renderTagsSection(options: {
       panel.appendChild(
         emptyState(
           'No characters matched',
-          'No characters match this query. A: searches character fields; C: searches character names. ' +
-            'Use T: to search exact tag names.',
+          'No character name contains this query. C: and bare text both match character names; ' +
+            'T: is the prefix that searches tag names.',
         ),
       )
       return panel
@@ -365,17 +488,18 @@ export function renderTagsSection(options: {
     for (const entry of matches.slice(0, shown)) {
       const id = entry.character?.id ?? ''
       const name = entry.character?.name ?? ''
+      const display = name === '' ? '(unnamed character)' : name
       const tags = Array.isArray(entry.tags) ? entry.tags : []
-      if (tags.length === 0) untagged.push(name === '' ? '(unnamed character)' : name)
+      if (tags.length === 0) untagged.push(display)
 
-      const item = sectionEl('lt-box lt-character-row')
+      const item = el('div', { class: 'lt-box lt-character-row' })
       item.setAttribute('role', 'listitem')
       item.appendChild(
         el('div', { class: 'lt-row lt-row--wrap' }, [
           avatar(avatarUrl(id), name, 28),
-          el('span', { class: 'lt-character-row__name' }, [name === '' ? '(unnamed character)' : name]),
-          el('span', { class: 'lt-badge lt-badge--muted' }, [shortId(id)]),
-          el('span', { class: 'lt-badge' }, [tagCountLabel(tags.length)]),
+          el('span', { class: 'lt-character-row__name' }, [display]),
+          badge(shortId(id), { tone: 'muted' }),
+          badge(tagCountLabel(tags.length)),
         ]),
       )
 
@@ -424,6 +548,11 @@ export function renderTagsSection(options: {
         'No tags yet',
         'A tag only exists while at least one character carries it. Assign a tag to a character ' +
           'and it appears here; when the last character loses it, the tag disappears again.',
+        button('Create Tag', {
+          variant: 'primary',
+          title: 'Create a new tag and assign it to characters',
+          onClick: () => requestDialog({ kind: 'create_tag' }),
+        }),
       )
     }
 
@@ -485,6 +614,8 @@ export function renderTagsSection(options: {
     const classes = ['lt-tag-row']
     // Selection is indicated by a class AND `aria-selected`, in every mode but
     // `normal`, so a bulk/merge selection is never conveyed by colour alone.
+    // In `normal` mode nothing can be selected at all, so ordinary browsing and
+    // bulk/merge selection stay two visually distinct states.
     if (mode !== 'normal' && (row.selected || isPrimary || isTarget)) {
       classes.push('lt-tag-row--selected')
     }
@@ -514,8 +645,16 @@ export function renderTagsSection(options: {
 
       // The store owns the toggle semantics, so the checkbox state is only a
       // reflection of it — a re-render is the source of truth.
-      const targetBox = buildCheckbox(isTarget, `Merge ${entry.name} into the primary tag`, () =>
-        store.actions.toggleMergeTarget(entry.key),
+      const targetBox = el('input', {
+        class: 'lt-checkbox',
+        type: 'checkbox',
+        'aria-label': `Merge ${entry.name} into the primary tag`,
+      })
+      targetBox.checked = isTarget
+      track(
+        on(targetBox, 'change', () => {
+          store.actions.toggleMergeTarget(entry.key)
+        }),
       )
       if (isSelfTarget) {
         targetBox.disabled = true
@@ -524,17 +663,27 @@ export function renderTagsSection(options: {
       }
       node.appendChild(targetBox)
     } else if (mode === 'bulk_delete') {
-      node.appendChild(
-        buildCheckbox(row.selected, `Select tag ${entry.name} for deletion`, (checked) =>
-          store.actions.toggleTagSelected(entry.key, checked),
-        ),
+      const box = el('input', {
+        class: 'lt-checkbox',
+        type: 'checkbox',
+        'aria-label': `Select tag ${entry.name} for deletion`,
+      })
+      box.checked = row.selected
+      track(
+        on(box, 'change', () => {
+          store.actions.toggleTagSelected(entry.key, box.checked)
+        }),
       )
+      node.appendChild(box)
     }
 
     // --- expand / collapse -------------------------------------------------
+    // A square icon-only disclosure at the HEAD of the row: shape, position and
+    // size all differ from the text buttons at its tail, so "show me this
+    // tag's characters" never gets confused with "act on this tag".
     node.appendChild(
       button(row.expanded ? '▾' : '▸', {
-        variant: 'ghost',
+        variant: 'icon-sm',
         ariaLabel: `${row.expanded ? 'Collapse' : 'Expand'} tag ${entry.name}`,
         title: row.expanded
           ? 'Hide the characters carrying this tag'
@@ -549,8 +698,8 @@ export function renderTagsSection(options: {
     main.appendChild(
       el('span', { class: 'lt-tag-row__meta' }, [characterCountLabel(entry.count)]),
     )
-    if (isPrimary) main.appendChild(el('span', { class: 'lt-badge lt-badge--accent' }, ['Primary']))
-    if (isTarget) main.appendChild(el('span', { class: 'lt-badge' }, ['Merge target']))
+    if (isPrimary) main.appendChild(badge('Primary', { tone: 'accent' }))
+    if (isTarget) main.appendChild(badge('Merge target'))
     if (isSelfTarget) {
       main.appendChild(
         el('span', { class: 'lt-tag-row__meta' }, ['primary — cannot be its own merge target']),
@@ -568,9 +717,12 @@ export function renderTagsSection(options: {
         onClick: () => requestDialog({ kind: 'rename_tag', tag: entry.name }),
       }),
     )
+    // `danger-ghost`, not a filled red button: deletion has to be
+    // recognisable without a wall of red in a list the reader is merely
+    // browsing through.
     actions.appendChild(
       button('Delete', {
-        variant: 'danger',
+        variant: 'danger-ghost',
         title: `Delete ${entry.name} from every character that carries it`,
         ariaLabel: `Delete tag ${entry.name}`,
         onClick: () => requestDialog({ kind: 'delete_tags', tags: [entry.name] }),
@@ -581,7 +733,13 @@ export function renderTagsSection(options: {
     return node
   }
 
-  /** The characters assigned to an expanded tag, resolved by id, never by name. */
+  /**
+   * The characters assigned to an expanded tag, resolved by id, never by name.
+   *
+   * Subordinate by construction: no row borders of its own, an indent behind a
+   * hairline rail and muted metadata (`.lt-tag-expanded` in `styles.ts` §10), so
+   * the sub-list never reads as a second list of the same importance.
+   */
   const renderExpanded = (view: StoreView, row: TagListRow): HTMLElement | null => {
     const ids = charactersForTag(view.tagIndex, row.entry.name)
     if (ids.length === 0) return null
@@ -603,7 +761,7 @@ export function renderTagsSection(options: {
         el('span', { class: 'lt-character-row__name' }, [
           name === '' ? '(unnamed character)' : name,
         ]),
-        el('span', { class: 'lt-badge lt-badge--muted' }, [shortId(id)]),
+        el('span', { class: 'lt-tag-row__meta' }, [shortId(id)]),
       ])
       if (tags.length > 0) {
         const chips = el('span', { class: 'lt-subtag-list' })
@@ -628,15 +786,21 @@ export function renderTagsSection(options: {
   // Bulk delete mode
   // ---------------------------------------------------------------------
 
+  /**
+   * The bulk-delete banner: it has to answer, without the reader counting rows,
+   * which mode is active, how many tags are selected, what will happen, what
+   * the available actions are and how to leave.
+   */
   const renderBulkToolbar = (view: StoreView): HTMLElement => {
     const banner = el('div', {
       class: 'lt-toolbar__banner',
       role: 'group',
       'aria-label': 'Bulk delete controls',
     })
+    banner.appendChild(badge('Bulk Delete Mode', { tone: 'accent' }))
     banner.appendChild(
       el('strong', {}, [
-        `Bulk Delete Mode — ${view.selectedTagCount} ${
+        `${view.selectedTagCount} ${
           view.selectedTagCount === 1 ? 'tag' : 'tags'
         } selected`,
       ]),
@@ -665,13 +829,6 @@ export function renderTagsSection(options: {
         onClick: () => store.actions.clearTagSelection(),
       }),
     )
-    actions.appendChild(
-      button('Cancel / Exit Bulk Delete Mode', {
-        variant: 'ghost',
-        title: 'Leave bulk delete mode without deleting anything',
-        onClick: () => store.actions.exitTagMode(),
-      }),
-    )
 
     const selectedNames = view.selectedTagKeys
       .map((key) => view.tagIndex.byKey.get(key)?.name)
@@ -683,9 +840,16 @@ export function renderTagsSection(options: {
       ariaLabel: 'Review and delete the selected tags',
       onClick: () => requestDialog({ kind: 'delete_tags', tags: selectedNames }),
     })
-    del.disabled = selectedNames.length === 0
-    del.setAttribute('aria-disabled', selectedNames.length === 0 ? 'true' : 'false')
+    setDisabled(del, selectedNames.length === 0)
     actions.appendChild(del)
+
+    actions.appendChild(
+      button('Cancel / Exit Bulk Delete Mode', {
+        variant: 'ghost',
+        title: 'Leave bulk delete mode without deleting anything',
+        onClick: () => store.actions.exitTagMode(),
+      }),
+    )
 
     banner.appendChild(actions)
     return banner
@@ -695,13 +859,21 @@ export function renderTagsSection(options: {
   // Merge mode
   // ---------------------------------------------------------------------
 
+  /** The merge banner, including the live primary/target review line. */
   const renderMergeToolbar = (view: StoreView): HTMLElement => {
     const banner = el('div', {
       class: 'lt-toolbar__banner',
       role: 'group',
       'aria-label': 'Merge controls',
     })
-    banner.appendChild(el('strong', {}, ['Merge Mode']))
+    banner.appendChild(badge('Merge Mode', { tone: 'accent' }))
+    banner.appendChild(
+      el('strong', {}, [
+        `${view.selectedTagCount} ${
+          view.selectedTagCount === 1 ? 'tag' : 'tags'
+        } selected`,
+      ]),
+    )
     banner.appendChild(
       el('span', {}, [
         'Choose exactly one PRIMARY tag (the radio control) and one or more distinct TARGET ' +
@@ -721,15 +893,13 @@ export function renderTagsSection(options: {
     summary.appendChild(el('span', { class: 'lt-tag-row__meta' }, ['Review:']))
     summary.appendChild(
       primaryName === null
-        ? el('span', { class: 'lt-badge lt-badge--muted' }, ['no primary tag chosen'])
-        : el('span', { class: 'lt-badge lt-badge--accent' }, [`primary: ${primaryName}`]),
+        ? badge('no primary tag chosen', { tone: 'muted' })
+        : badge(`primary: ${primaryName}`, { tone: 'accent' }),
     )
     if (targetNames.length === 0) {
-      summary.appendChild(el('span', { class: 'lt-badge lt-badge--muted' }, ['no targets chosen']))
+      summary.appendChild(badge('no targets chosen', { tone: 'muted' }))
     } else {
-      for (const name of targetNames) {
-        summary.appendChild(el('span', { class: 'lt-badge' }, [`target: ${name}`]))
-      }
+      for (const name of targetNames) summary.appendChild(badge(`target: ${name}`))
     }
     summary.appendChild(
       el('span', { class: 'lt-tag-row__meta' }, [
@@ -749,8 +919,7 @@ export function renderTagsSection(options: {
       ariaLabel: 'Review and merge the selected tags',
       onClick: () => requestDialog({ kind: 'merge_review' }),
     })
-    merge.disabled = !view.mergeValid
-    merge.setAttribute('aria-disabled', view.mergeValid ? 'false' : 'true')
+    setDisabled(merge, !view.mergeValid)
     actions.appendChild(merge)
     actions.appendChild(
       button('Cancel / Exit Merge Mode', {
@@ -789,17 +958,16 @@ export function renderTagsSection(options: {
     teardown()
     clear(container)
 
-    const toolbar = renderToolbar(view)
-    const searchInput = buildSearch(view.tagQuery, (v) => {
-      if (searchTimer) clearTimeout(searchTimer)
-      searchTimer = setTimeout(() => store.actions.setTagQuery(v), 250)
-    })
-    const searchBar = el('div', { class: 'lt-toolbar__search' })
-    searchBar.appendChild(field('Search', searchInput))
-    toolbar.insertBefore(searchBar, toolbar.firstChild)
+    const root = el('div', { class: 'lt-box' })
+    root.appendChild(renderContext(view))
 
-    const root = sectionEl('lt-box')
-    root.appendChild(toolbar)
+    const search = buildSearch(view.tagQuery, (value) => {
+      if (searchTimer) clearTimeout(searchTimer)
+      // The SHARED debounce constant, so the Tags and Characters searches can
+      // never drift apart and so the tests can advance by the real value.
+      searchTimer = setTimeout(() => store.actions.setTagQuery(value), SEARCH_DEBOUNCE_MS)
+    })
+    root.appendChild(renderToolbar(view, search))
 
     const errors = renderQueryErrors(view)
     if (errors) root.appendChild(errors)
@@ -818,7 +986,7 @@ export function renderTagsSection(options: {
     else if (view.tagMode === 'merge') root.appendChild(renderMergeToolbar(view))
 
     // In `C:` mode the tag list is deliberately NOT rendered, and there is no
-    // fallback to a tag-name search: the panel below explains why.
+    // fallback to a tag-name search: the panel above explains why.
     if (view.tagQueryIsCharacterMode) root.appendChild(renderCharacterMode(view))
     else root.appendChild(renderTagList(view))
 

@@ -24,16 +24,39 @@
  *
  * Accessibility: each overlay is a `role="dialog" aria-modal="true"` element
  * labelled by its own title, traps Tab, closes on Escape, and returns focus to
- * whatever opened it. At most {@link MAX_STACKED} overlays exist at once — the
- * oldest is closed when a third is requested, mirroring the host's own limit.
+ * whatever opened it. At most `MAX_STACKED` overlays exist at once — the oldest
+ * is closed when a third is requested, mirroring the host's own limit.
  *
- * ## Where a dialog is mounted
+ * ## Where a dialog is mounted, and what this module owns
  *
- * On `document.body`, never inside the host's drawer tab panel. A transformed,
- * isolated or contained ancestor becomes the containing block for its
- * `position: fixed` descendants, so an in-drawer overlay sized itself against
- * the drawer instead of the viewport and every dialog rendered visibly
- * off-centre on a phone. See {@link portalParent}.
+ * Mounting, the backdrop, the Escape/Tab contract, focus return, the scroll
+ * lock and the close control all live in `dialog-host.ts`, which ports
+ * `ModalShell.tsx`. Overlays mount on `document.body`, never inside the host's
+ * drawer tab panel: a transformed, isolated or contained ancestor becomes the
+ * containing block for its `position: fixed` descendants, so an in-drawer
+ * overlay sized itself against the drawer instead of the viewport and every
+ * dialog rendered visibly off-centre on a phone. See `portalParent` there for
+ * the full reasoning — do not "simplify" it back.
+ *
+ * This module owns the CONTENT: what each dialog says, which fields it keeps,
+ * and which control performs the store action.
+ *
+ * ## Visual contract
+ *
+ * Adapted from `ModalShell.module.css` / `ConfirmationModal.module.css` and
+ * carried entirely by `styles.ts`:
+ *
+ *  - one `.lt-dialog` shell at 560px; a plain confirmation is narrowed to the
+ *    host's 420px;
+ *  - title 16px/600, description muted 12px, body 12px with a 14px rhythm;
+ *  - footer actions right-aligned, `.lt-btn--primary` for the affirmative and
+ *    `.lt-btn--danger` for the destructive one, `.lt-btn` (the host's default
+ *    outline: subtle fill + hairline + inset highlight) for Cancel and Back;
+ *  - ≤480px the actions stack `column-reverse`, which `styles.ts` already does.
+ *
+ * Review dialogs (merge, bulk assign/unassign, delete) deliberately keep their
+ * own tables and lists instead of being flattened into a generic confirmation:
+ * a review that cannot show WHAT will change is not a review.
  */
 
 import { classifyError } from '../mutations/executor'
@@ -42,8 +65,30 @@ import { summarizeReport, type OperationReport } from '../mutations/report'
 import { type SearchHelpSection } from '../search/search-help'
 import type { TagManagerStore, StoreView } from '../store'
 import { tagKey, type TagEntry } from '../tag-index'
-import { setDialogOpener } from './dialog-host'
-import { button, clear, el, field, on, row, setBusy, setDisabled, text } from './dom'
+import {
+  clearDialogOpener,
+  closeAllOverlays,
+  openOverlay,
+  portalParent,
+  setActions,
+  setDialogOpener,
+  type OverlayHandle,
+} from './dialog-host'
+import {
+  badge,
+  button,
+  checkbox,
+  clear,
+  el,
+  field,
+  on,
+  row,
+  searchFieldOf,
+  searchInput,
+  setBusy,
+  setDisabled,
+  text,
+} from './dom'
 import type { DialogRequest } from './shell'
 
 // ---------------------------------------------------------------------------
@@ -67,105 +112,102 @@ export interface DialogHost {
 }
 
 // ---------------------------------------------------------------------------
-// Overlay primitives
+// Review tables
 // ---------------------------------------------------------------------------
 
-/** The host allows two stacked modals; in-panel overlays follow the same cap. */
-const MAX_STACKED = 2
+/**
+ * How many rows a review table renders before it says so.
+ *
+ * 200 matches `cappedList`'s cap, so a tabulated review can never become slower
+ * to read than the line list it replaced. The overflow is always disclosed —
+ * see {@link truncationNote} — and, as before, every tag past the cap is still
+ * counted in the totals, named in the confirm message, and passed whole to the
+ * store action. The cap hides rows, never reachability.
+ */
+const REVIEW_ROW_LIMIT = 200
 
-/** Focusable descendants, in DOM order, for the Tab trap. */
-const FOCUSABLE_SELECTOR = [
-  'a[href]',
-  'button:not([disabled])',
-  'input:not([disabled])',
-  'select:not([disabled])',
-  'textarea:not([disabled])',
-  '[tabindex]:not([tabindex="-1"])',
-].join(',')
-
-interface OverlayHandle {
-  /** The fixed, full-root backdrop. */
-  element: HTMLElement
-  /** The `.lt-dialog` panel inside it. */
-  panel: HTMLElement
-  /** Content region, replaceable via {@link replaceBody}. */
-  body: HTMLElement
-  /** Footer region for the dialog's controls. */
-  actions: HTMLElement
-  /** Show a validation/error message inside the panel. An empty string clears. */
-  showMessage(kind: 'error' | 'warning' | 'info', message: string): void
-  replaceBody(node: HTMLElement): void
-  close(): void
+/**
+ * Column widths for a review table.
+ *
+ * `.lt-table` is `table-layout: fixed`, which is what stops the columns
+ * re-flowing every time a message changes length. That also means the widths
+ * have to be declared, and `styles.ts` (which owns the table's geometry) has no
+ * per-column rules to borrow, so they are carried by a `<colgroup>`: the
+ * standard, cell-free way to size columns. Nothing else about the table is
+ * styled here — padding, hairlines, density and header weight are all the
+ * stylesheet's.
+ */
+function columnWidths(table: HTMLElement, widths: readonly string[]): void {
+  const group = el('colgroup')
+  for (const width of widths) group.appendChild(el('col', { style: `width:${width};` }))
+  table.appendChild(group)
 }
 
 /**
- * Per-root overlay stacks, so two tabs cannot fight over one global list.
+ * A real `<table class="lt-table">` for a dialog that has to REVIEW something.
  *
- * The key is still `host.root` even though overlays no longer live there: it is
- * the *logical* owner of the dialogs, and the stack is what keeps the
- * MAX_STACKED cap per tab rather than global. Keying it on the portal parent
- * instead would let one extension instance's third dialog close another
- * instance's dialog.
+ * The merge, delete and bulk reviews are not confirmations with a sentence in
+ * them: they exist so the reader can check WHICH records change and HOW MANY.
+ * A list of identical lines cannot show that, and forcing them into the host's
+ * 420px confirmation shape would delete the only reason they exist.
+ *
+ * `headings` is `[[label, width], …]`; `rows` is a list of cell contents, each
+ * either a string or a pre-built element (a badge, a strong name). User strings
+ * always arrive as `Text` via `text()`/`el()` — never as markup.
  */
-const stacks = new WeakMap<HTMLElement, OverlayHandle[]>()
+function reviewTable(
+  headings: readonly (readonly [string, string])[],
+  rows: readonly (readonly (string | Node)[])[],
+): HTMLElement {
+  const table = el('table', { class: 'lt-table' })
+  columnWidths(
+    table,
+    headings.map(([, width]) => width),
+  )
 
-function stackFor(root: HTMLElement): OverlayHandle[] {
-  let stack = stacks.get(root)
-  if (!stack) {
-    stack = []
-    stacks.set(root, stack)
+  const thead = el('thead')
+  const headRow = el('tr')
+  for (const [label] of headings) {
+    headRow.appendChild(el('th', { scope: 'col' }, [label]))
   }
-  return stack
+  thead.appendChild(headRow)
+  table.appendChild(thead)
+
+  const tbody = el('tbody')
+  for (const cells of rows) {
+    const tr = el('tr')
+    for (const [index, cell] of cells.entries()) {
+      // The first column names the row, so it is a row header — the same
+      // `th[scope="row"]` convention the failure table uses.
+      const cell_ = index === 0
+        ? el('th', { scope: 'row' }, [cell as string | Node])
+        : el('td', {}, [cell as string | Node])
+      tr.appendChild(cell_)
+    }
+    tbody.appendChild(tr)
+  }
+  table.appendChild(tbody)
+
+  // `.lt-dialog__list` is the dialog's scroll container (240px, contained
+  // overscroll); the table rides inside it so a long review scrolls instead of
+  // pushing the footer off screen.
+  const scroll = el('div', { class: 'lt-dialog__list' })
+  scroll.appendChild(table)
+  return scroll
 }
 
 /**
- * Where an overlay is mounted: the document body, NOT `host.root`.
+ * A cap disclosure for a review list that is longer than what is rendered.
  *
- * ## Why this is not "the dialog container the host gave us"
- *
- * `.lt-dialog-overlay` is `position: fixed; inset: 0`, and its whole job is to
- * cover the viewport so the dialog lands in the middle of the SCREEN. That only
- * holds while the overlay's containing block is the viewport.
- *
- * Per CSS, an ancestor with `transform`, `will-change: transform`, `filter`,
- * `contain: layout|paint`, `backdrop-filter`, or `isolation: isolate` BECOMES
- * the containing block for its `position: fixed` descendants — `inset: 0`
- * then resolves against that ancestor's box, not the viewport. The host's
- * drawer panel is exactly such an ancestor (Lumiverse
- * `ViewportDrawer.module.css`: `transition: transform …` on the drawer root,
- * `transform: translateX(…)` on the panel, `isolation: isolate` on `.drawer`),
- * and `host.root` — the drawer tab panel we were handed — sits inside it.
- *
- * So `inset: 0` resolved against a 320px-wide drawer in a 360px viewport and
- * the overlay measured `left: 40 → right: 360`. The dialog was perfectly
- * centred INSIDE that overlay and still 20px right of centre on screen. That is
- * why a round of width/`box-sizing` fixes could never cure it: they were
- * correct, but the fault was the containing block, not the size.
- *
- * Appending to `document.body` puts the overlay outside every transformed,
- * isolated or contained host wrapper, so `inset: 0` really is the viewport.
- *
- * ## Why that also removed the remount machinery
- *
- * The shell owns `host.root` and empties it on every store change, which used
- * to wipe an open dialog on any unrelated re-render (typing in the search box
- * mid-dialog closed it). The old workaround re-appended the overlay into
- * `host.root` from a store subscription — which is precisely what dragged it
- * back into the drawer's containing block and produced the off-centre dialog.
- * Mounting on `document.body` fixes both problems at once: the shell does not
- * own `document.body`, so the overlay survives re-renders for free and no
- * subscription (and no observer fighting a reparent) is needed at all.
- *
- * DO NOT "simplify" this back to `host.root.appendChild(element)`, and do not
- * reintroduce a store-subscription remount: they undo the fix.
+ * A capped list that looks complete is how a reader concludes a tag was never
+ * considered, so the overflow is always stated in visible text — the same rule
+ * the failure report follows.
  */
-function portalParent(host: DialogHost): HTMLElement {
-  // `ownerDocument` rather than the bare `document`: the overlay must be
-  // mounted in the document the host root actually lives in.
-  return host.root.ownerDocument.body
+function truncationNote(shown: number, total: number, noun: string): HTMLElement {
+  return el('p', { class: 'lt-dialog__desc' }, [
+    `Showing ${shown} of ${total} ${noun}. The remaining ${total - shown} are not listed here, but they are all included in the action that follows.`,
+  ])
 }
-
-let titleSeq = 0
 
 /** A UI-safe message for anything thrown by a store action. Never a stack trace. */
 function safeMessage(error: unknown, fallback: string): string {
@@ -175,171 +217,6 @@ function safeMessage(error: unknown, fallback: string): string {
   } catch {
     return fallback
   }
-}
-
-/**
- * Open the in-panel overlay.
- *
- * Positions itself over the VIEWPORT and wires the accessible dialog contract.
- * It is mounted on `document.body`, not on `host.root` — {@link portalParent}
- * explains the transformed-ancestor containing-block trap that makes an
- * in-drawer mount render off-centre.
- * Both the overlay and the panel are laid out entirely by the stylesheet (see
- * the `.lt-dialog-overlay` / `.lt-dialog` rules in styles.ts). This used to
- * inline a duplicate of every layout declaration here, which was both redundant
- * and harmful: an inline declaration beats the stylesheet, so the stylesheet's
- * narrow-viewport rules (tighter overlay padding, `box-sizing: border-box`)
- * could never take effect and the panel kept its content-box width — 22px wider
- * than the padded overlay — and ran off the right edge of a phone screen.
- */
-function openOverlay(host: DialogHost, title: string, description?: string): OverlayHandle {
-  const stack = stackFor(host.root)
-
-  // Hard cap: closing the oldest keeps the stack bounded even if a caller
-  // ignores the "one dialog at a time" convention.
-  while (stack.length >= MAX_STACKED) {
-    const oldest = stack.shift()
-    oldest?.close()
-  }
-
-  const restoreTo = document.activeElement instanceof HTMLElement ? document.activeElement : null
-  const titleId = `lt-dialog-title-${++titleSeq}`
-  const disposers: (() => void)[] = []
-  let closed = false
-
-  const messageHost = el('div', { class: 'lt-dialog__messages' })
-  const body = el('div', { class: 'lt-dialog__body' })
-  const actions = el('div', { class: 'lt-dialog__actions' })
-
-  // Class only. `position`, `width: min(560px, 100%)`, `max-height`,
-  // `overflow-y`, `box-sizing: border-box` and the `100vw` cap all come from
-  // `.lt-dialog` in styles.ts. An earlier version inlined
-  // `width: min(560px, 100%)` under the default content-box sizing: the 10px
-  // padding plus 1px border were added on top of that width, so on a phone the
-  // panel rendered 22px wider than the padded overlay and was clipped off the
-  // right edge of the screen.
-  const panel = el('div', {
-    class: 'lt-dialog',
-    role: 'dialog',
-    'aria-modal': 'true',
-    'aria-labelledby': titleId,
-    tabindex: '-1',
-  })
-  panel.appendChild(el('h3', { class: 'lt-dialog__title', id: titleId }, [title]))
-  if (description !== undefined && description !== '') {
-    panel.appendChild(el('p', { class: 'lt-dialog__desc' }, [description]))
-  }
-  panel.appendChild(messageHost)
-  panel.appendChild(body)
-  panel.appendChild(actions)
-
-  // Class only — no inline style. `.lt-dialog-overlay` in styles.ts owns the
-  // fixed positioning, the flex centring and the 12px/8px responsive padding.
-  // The hardcoded `rgba(0,0,0,0.45)` that used to live here was also
-  // theme-blind; the stylesheet composes the scrim from `--lumiverse-text`
-  // instead. Both of those inline declarations outranked the stylesheet, which
-  // is exactly why the mobile padding override could not take effect.
-  const element = el('div', { class: 'lt-dialog-overlay' })
-  element.appendChild(panel)
-
-  const handle: OverlayHandle = {
-    element,
-    panel,
-    body,
-    actions,
-    showMessage: (kind, message) => {
-      clear(messageHost)
-      if (message === '') return
-      // Warnings are `role="alert"` too: a stale-preview warning BLOCKS the
-      // action, so it must be announced rather than sit quietly in the panel.
-      const state = el('div', {
-        class: kind === 'error' ? 'lt-state lt-state--error' : 'lt-toolbar__banner',
-        role: 'alert',
-      })
-      state.appendChild(el('span', {}, [message]))
-      messageHost.appendChild(state)
-    },
-    replaceBody: (node) => {
-      clear(body)
-      body.appendChild(node)
-    },
-    close,
-  }
-
-  function close(): void {
-    if (closed) return
-    closed = true
-    for (const dispose of disposers) {
-      try {
-        dispose()
-      } catch {
-        // A failing disposer must not leave the overlay stuck open.
-      }
-    }
-    disposers.length = 0
-    element.remove()
-    const live = stackFor(host.root)
-    const at = live.indexOf(handle)
-    if (at >= 0) live.splice(at, 1)
-    // Focus returns to whatever opened the dialog, so keyboard and
-    // screen-reader users are not dumped back at the top of the document.
-    if (restoreTo !== null && restoreTo.isConnected) {
-      try {
-        restoreTo.focus()
-      } catch {
-        // A trigger that vanished is not an error worth surfacing.
-      }
-    }
-  }
-
-  disposers.push(
-    on(element, 'keydown', (ev) => {
-      const event = ev as KeyboardEvent
-      if (event.key === 'Escape') {
-        // Escape is always a cancel: never a confirm.
-        event.preventDefault()
-        event.stopPropagation()
-        close()
-        return
-      }
-      if (event.key !== 'Tab') return
-      const focusable = [...panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)]
-      if (focusable.length === 0) {
-        event.preventDefault()
-        return
-      }
-      const first = focusable[0] as HTMLElement
-      const last = focusable[focusable.length - 1] as HTMLElement
-      const active = document.activeElement
-      if (event.shiftKey && (active === first || !panel.contains(active))) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && (active === last || !panel.contains(active))) {
-        event.preventDefault()
-        first.focus()
-      }
-    }),
-    // A click on the backdrop cancels, mirroring a native modal's scrim.
-    on(element, 'mousedown', (ev) => {
-      if (ev.target === element) close()
-    }),
-  )
-
-  // Mounted on document.body, NOT on host.root — see {@link portalParent} for
-  // the transformed-ancestor containing-block trap that makes this mandatory.
-  portalParent(host).appendChild(element)
-  stack.push(handle)
-  const focusTarget = panel.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)
-  if (focusTarget !== null) focusTarget.focus()
-  else panel.focus()
-
-  return handle
-}
-
-/** Replace a dialog's footer controls. */
-function setActions(handle: OverlayHandle, ...controls: HTMLElement[]): void {
-  clear(handle.actions)
-  for (const control of controls) handle.actions.appendChild(control)
 }
 
 /** A scrollable list of lines, capped so a large selection stays responsive. */
@@ -392,7 +269,10 @@ async function requestConfirm(
   }
 
   return new Promise<boolean>((resolve) => {
-    const fallback = openOverlay(host, title)
+    // `narrow` is the host's own split: `ConfirmationModal` renders inside
+    // `ModalShell maxWidth={420}`, so a two-line message with two buttons gets
+    // the 420px confirmation shell, not the 560px form/review shell.
+    const fallback = openOverlay(host.root, title, undefined, { narrow: true })
     fallback.replaceBody(el('p', { class: 'lt-dialog__desc' }, [message]))
     let settled = false
     const settle = (value: boolean): void => {
@@ -405,23 +285,28 @@ async function requestConfirm(
       // Dismissed by Escape or the scrim: that is a cancel, never a confirm.
       if (!fallback.element.isConnected) settle(false)
     })
-    // Watch the PORTAL, not `host.root`. The overlay is mounted on document.body
-    // (see portalParent), so a childList change in the drawer tab root says
-    // nothing about whether it is still open — and must NOT be read as a
+    // Watch the PORTAL, not the drawer tab root. The overlay is mounted on
+    // document.body (see `portalParent`), so a childList change in the tab root
+    // says nothing about whether it is still open — and must NOT be read as a
     // dismissal, or every unrelated re-render would silently cancel the
     // confirm.
-    observer.observe(portalParent(host), { childList: true })
+    observer.observe(portalParent(host.root), { childList: true })
     setActions(
       fallback,
       button('Cancel', {
-        variant: 'ghost',
+        // The host's cancel is its DEFAULT button: subtle fill, one hairline,
+        // inset highlight — not a borderless ghost, which reads as "nothing
+        // happens here" next to a filled confirm.
+        variant: 'default',
         onClick: () => {
           settle(false)
           fallback.close()
         },
       }),
       button(options.confirmLabel ?? 'Confirm', {
-        variant: 'danger',
+        // Only a destructive confirmation gets the danger treatment; an
+        // additive one (create, assign) must not be painted as a deletion.
+        variant: options.variant === 'danger' ? 'danger' : 'primary',
         onClick: () => {
           settle(true)
           fallback.close()
@@ -489,10 +374,10 @@ function showOutcome(handle: OverlayHandle, store: TagManagerStore, context: str
     }
     wrap.appendChild(el('p', {}, [el('strong', {}, [statusLabel(report)])]))
     wrap.appendChild(el('p', { class: 'lt-dialog__desc' }, [headline]))
-    const pre = el('pre', {
-      class: 'lt-dialog__desc',
-      style: 'white-space:pre-wrap;margin:4px 0 0;',
-    })
+    // `.lt-dialog pre` already supplies the mono face, the fill and the radius;
+    // only the wrapping is added here, because the summary is a multi-line block
+    // and `pre` would otherwise scroll it sideways.
+    const pre = el('pre', { style: 'white-space:pre-wrap;' })
     pre.appendChild(text(summarizeReport(report)))
     wrap.appendChild(pre)
   }
@@ -507,9 +392,19 @@ function showOutcome(handle: OverlayHandle, store: TagManagerStore, context: str
 /**
  * Run a store action behind a busy confirm control.
  *
- * The control is disabled for the whole call, so a second click cannot start a
- * second copy of the same destructive operation, and the outcome replaces the
- * form in place.
+ * EVERY footer control is disabled for the whole call, not just the confirm
+ * one: the host's `ConfirmationModal` does the same (`cancelBtn` and
+ * `confirmBtn` both take `disabled={loading}`), because a live Back/Cancel
+ * beside a running write is a conflicting action and the reader must not be
+ * able to navigate away from an operation that is mid-flight. The confirm
+ * control additionally goes busy — `aria-busy`, `.lt-btn--loading` and a
+ * "Applying…" label — so the state is announced rather than merely greyed.
+ *
+ * Escape and the backdrop are deliberately left working, unlike the host's
+ * `closeOnEscape={!loading}`: LumiTag's writes are idempotent per mutation, the
+ * panel below reports whatever lands whether or not the dialog is still open,
+ * and an overlay that cannot be dismissed is a worse failure than an in-flight
+ * write the reader walks away from. Closing never performs an action.
  */
 async function runAction(
   handle: OverlayHandle,
@@ -519,6 +414,14 @@ async function runAction(
   store: TagManagerStore,
 ): Promise<void> {
   if (control.disabled) return
+  // Snapshot the footer's prior enabled state so a control that was already
+  // disabled (an unready merge, an empty selection) stays disabled afterwards.
+  const footer = [...handle.actions.children].filter(
+    (node): node is HTMLButtonElement => node instanceof HTMLButtonElement,
+  )
+  const prior = footer.map((node) => [node, node.disabled] as const)
+  for (const node of footer) setDisabled(node, true)
+
   setBusy(control, true, 'Applying…')
   handle.showMessage('info', '')
   try {
@@ -527,6 +430,9 @@ async function runAction(
     handle.showMessage('error', safeMessage(error, 'The operation could not be started.'))
   } finally {
     setBusy(control, false)
+    for (const [node, wasDisabled] of prior) {
+      if (!wasDisabled) setDisabled(node, false)
+    }
   }
   showOutcome(handle, store, context)
 }
@@ -546,7 +452,7 @@ async function runAction(
 function openCreateTag(host: DialogHost): void {
   const { store } = host
   const handle = openOverlay(
-    host,
+    host.root,
     'Create tag',
     'A new tag is created and assigned to the characters you pick. This is saved for every character you select.',
   )
@@ -568,11 +474,15 @@ function openCreateTag(host: DialogHost): void {
     return term === '' || name.toLowerCase().includes(term) || id.toLowerCase().includes(term)
   }
 
+  /** The characters the picker's current search term actually leaves visible. */
+  const matching = (): StoreView['characters'] =>
+    characters().filter((c) => matchesTerm(c.name, c.id))
+
   const renderPicker = (): void => {
     clear(pickerList)
     const rows = characters()
-    const matching = rows.filter((c) => matchesTerm(c.name, c.id))
-    if (matching.length === 0) {
+    const matches = matching()
+    if (matches.length === 0) {
       pickerList.appendChild(
         el('p', { class: 'lt-dialog__desc' }, [
           rows.length === 0
@@ -581,23 +491,26 @@ function openCreateTag(host: DialogHost): void {
         ]),
       )
     }
-    for (const character of matching) {
+    for (const character of matches) {
       const line = el('div', { class: 'lt-row lt-row--wrap' })
-      const box = el('input', { class: 'lt-checkbox', type: 'checkbox' })
-      box.checked = selected.has(character.id)
-      box.setAttribute('aria-label', `Assign ${character.name || character.id}`)
-      on(box, 'change', () => {
-        if (box.checked) selected.add(character.id)
+      // `dom.checkbox` is the native input with `accent-color`, and its listener
+      // is registered against the node — so `clear(pickerList)` above releases
+      // it. Hand-rolling the input here is what used to leak one `change`
+      // handler per re-render of the picker.
+      const box = checkbox(selected.has(character.id), `Assign ${character.name || character.id}`, (checked) => {
+        if (checked) selected.add(character.id)
         else selected.delete(character.id)
         renderCounts()
       })
       line.appendChild(box)
-      line.appendChild(el('span', {}, [character.name || character.id]))
+      line.appendChild(el('span', { class: 'lt-row--grow' }, [character.name || character.id]))
       if (character.tags.length > 0) {
         line.appendChild(
-          el('span', { class: 'lt-badge lt-badge--muted' }, [
-            `${character.tags.length} tag${character.tags.length === 1 ? '' : 's'}`,
-          ]),
+          badge(`${character.tags.length} tag${character.tags.length === 1 ? '' : 's'}`, {
+            // A count of existing associations is metadata, never a state, so
+            // it stays neutral.
+            tone: 'muted',
+          }),
         )
       }
       pickerList.appendChild(line)
@@ -606,7 +519,18 @@ function openCreateTag(host: DialogHost): void {
 
   const renderCounts = (): void => {
     clear(pickerCount)
-    pickerCount.appendChild(text(`${selected.size} of ${characters().length} selected`))
+    pickerCount.appendChild(
+      row(
+        el('span', { class: 'lt-dialog__desc' }, [
+          text(`${selected.size} of ${characters().length} selected`),
+        ]),
+        el('span', { class: 'lt-dialog__desc' }, [
+          text(matching().length === characters().length
+            ? 'Showing every loaded character.'
+            : `Filtered to ${matching().length} of ${characters().length}.`),
+        ]),
+      ),
+    )
   }
 
   /**
@@ -655,7 +579,7 @@ function openCreateTag(host: DialogHost): void {
       })
       setActions(
         handle,
-        button('Cancel', { variant: 'ghost', onClick: () => handle.close() }),
+        button('Cancel', { variant: 'default', onClick: () => handle.close() }),
         assignButton,
       )
       return
@@ -681,7 +605,7 @@ function openCreateTag(host: DialogHost): void {
     })
     setActions(
       handle,
-      button('Back', { variant: 'ghost', onClick: () => renderForm() }),
+      button('Back', { variant: 'default', onClick: () => renderForm() }),
       confirmButton,
     )
   }
@@ -737,40 +661,53 @@ function openCreateTag(host: DialogHost): void {
     })
     on(nameInput, 'input', () => handle.showMessage('info', ''))
 
-    const pickerSearch = el('input', {
-      class: 'lt-search',
-      type: 'search',
-      placeholder: 'Search characters to assign',
-      'aria-label': 'Search characters to assign',
-      autocomplete: 'off',
-    })
-    on(pickerSearch, 'input', () => {
-      searchTerm = pickerSearch.value
+    // `dom.searchInput` builds the host's SearchField: a subtle-filled, hairline
+    // pill with the dimmed 14px leading icon, a borderless 13px input and a clear
+    // control that appears only when there is something to clear. The bare
+    // `.lt-search` this replaces had none of that — inside a dialog it fell back
+    // to the standalone slab rule, with no icon and no clear affordance.
+    const pickerSearch = searchInput('Search characters to assign', '', (value) => {
+      searchTerm = value
       renderPicker()
+      renderCounts()
     })
+    // `field()` places the registered wrapper — the whole pill, leading icon and
+    // clear control included — inside the `<label>`, so the control keeps its
+    // accessible name AND renders as the native `SearchField` instead of a bare
+    // `.lt-search` slab.
+    const searchPill = searchFieldOf(pickerSearch)
+    const pickerSearchField = field('Characters', pickerSearch, undefined)
+    if (searchPill !== null && !pickerSearchField.contains(searchPill)) {
+      // `field()` nests a registered wrapper itself; this only fires if the
+      // accessor and the field registry ever disagree, and puts the pill back
+      // rather than rendering an unadorned input.
+      pickerSearchField.appendChild(searchPill)
+    }
 
-    pickerCount = el('p', { class: 'lt-dialog__desc' })
-    pickerList = el('div', { class: 'lt-dialog__list', style: 'max-height:220px;overflow-y:auto;' })
+    pickerCount = el('div', { class: 'lt-dialog__desc' })
+    // Class only: `.lt-dialog__list` already carries the dialog's scroll
+    // container (max-height, `overflow-y`, contained overscroll), so the picker
+    // does not restate its height inline and outrank the stylesheet.
+    pickerList = el('div', { class: 'lt-dialog__list' })
 
     const picker = el('div')
-    picker.appendChild(el('p', { class: 'lt-dialog__desc' }, ['Characters']))
-    picker.appendChild(pickerSearch)
+    picker.appendChild(pickerSearchField)
     picker.appendChild(pickerCount)
     picker.appendChild(pickerList)
     picker.appendChild(
       row(
         button('Select all shown', {
-          variant: 'ghost',
+          variant: 'default',
+          title: 'Tick every character the current search leaves visible',
           onClick: () => {
-            for (const c of characters()) {
-              if (matchesTerm(c.name, c.id)) selected.add(c.id)
-            }
+            for (const c of matching()) selected.add(c.id)
             renderPicker()
             renderCounts()
           },
         }),
         button('Clear selection', {
-          variant: 'ghost',
+          variant: 'default',
+          title: 'Untick every character',
           onClick: () => {
             selected.clear()
             renderPicker()
@@ -792,7 +729,7 @@ function openCreateTag(host: DialogHost): void {
 
     setActions(
       handle,
-      button('Cancel', { variant: 'ghost', onClick: () => handle.close() }),
+      button('Cancel', { variant: 'default', onClick: () => handle.close() }),
       button('Review', { variant: 'primary', onClick: () => showReview() }),
     )
   }
@@ -814,7 +751,7 @@ function openCreateTag(host: DialogHost): void {
 function openRenameTag(host: DialogHost, tag: string): void {
   const { store } = host
   const handle = openOverlay(
-    host,
+    host.root,
     `Rename "${tag}"`,
     'Renaming changes this tag on every character that has it, not only the ones visible in the current filter.',
   )
@@ -866,7 +803,7 @@ function openRenameTag(host: DialogHost, tag: string): void {
     })
     setActions(
       handle,
-      button('Back', { variant: 'ghost', onClick: () => renderForm() }),
+      button('Back', { variant: 'default', onClick: () => renderForm() }),
       confirmButton,
     )
   }
@@ -929,7 +866,7 @@ function openRenameTag(host: DialogHost, tag: string): void {
     handle.replaceBody(form)
     setActions(
       handle,
-      button('Cancel', { variant: 'ghost', onClick: () => handle.close() }),
+      button('Cancel', { variant: 'default', onClick: () => handle.close() }),
       button('Review', { variant: 'primary', onClick: () => showReview() }),
     )
   }
@@ -950,7 +887,7 @@ function displayName(index: StoreView['tagIndex'], key: string): string {
 function openMergeReview(host: DialogHost): void {
   const { store } = host
   const handle = openOverlay(
-    host,
+    host.root,
     'Review merge',
     'Every selected tag is folded into the primary tag on every character that carries it.',
   )
@@ -977,17 +914,40 @@ function openMergeReview(host: DialogHost): void {
   const blocked =
     primaryKey === null || targetKeys.length === 0 || !view().mergeValid || primaryAmongTargets
 
-  const wrap = el('div', { class: 'lt-dialog__summary' })
-  wrap.appendChild(
+  const wrap = el('div')
+  const headline = el('div', { class: 'lt-dialog__summary' })
+  headline.appendChild(
     el('p', {}, [el('strong', {}, [`Primary tag: ${primaryName === '' ? '(none selected)' : primaryName}`])]),
   )
-  wrap.appendChild(el('p', { class: 'lt-dialog__desc' }, [`Tags merged in (${targetNames.length}):`]))
-  wrap.appendChild(cappedList(targetNames))
-  wrap.appendChild(
+  headline.appendChild(
     el('p', { class: 'lt-dialog__desc' }, [
       `${characterCount(affected())} will be updated: each gains "${primaryName}" where it is missing, and the tags merged in are removed from them.`,
     ]),
   )
+  wrap.appendChild(headline)
+
+  // A merge is a list of NAMED records with a real per-record weight, so it is
+  // a table and not a stack of identical lines: the reader's question is "which
+  // tag disappears and how many characters does that touch", and two columns
+  // answer it where a sentence cannot.
+  const rows = targetKeys.slice(0, REVIEW_ROW_LIMIT).map((key): (string | Node)[] => {
+    const name = displayName(view().tagIndex, key)
+    const count = view().tagIndex.byKey.get(key)?.count ?? 0
+    return [name, badge(count === 0 ? 'no assignments' : characterCount(count), { tone: count === 0 ? 'muted' : 'default' })]
+  })
+  wrap.appendChild(
+    reviewTable(
+      [
+        [`Tags merged in (${targetNames.length})`, '64%'],
+        ['Characters', '36%'],
+      ],
+      rows,
+    ),
+  )
+  if (targetKeys.length > REVIEW_ROW_LIMIT) {
+    wrap.appendChild(truncationNote(REVIEW_ROW_LIMIT, targetKeys.length, 'tags merged in'))
+  }
+
   wrap.appendChild(
     el('p', { class: 'lt-dialog__desc' }, [
       'Assignments are consolidated into the primary tag. No characters are added or deleted, and this is not a single undoable step — rename or delete the leftovers afterwards if you need to.',
@@ -1013,7 +973,7 @@ function openMergeReview(host: DialogHost): void {
   setDisabled(confirmButton, blocked)
   setActions(
     handle,
-    button('Cancel', { variant: 'ghost', onClick: () => handle.close() }),
+    button('Cancel', { variant: 'default', onClick: () => handle.close() }),
     confirmButton,
   )
 
@@ -1044,7 +1004,7 @@ function openMergeReview(host: DialogHost): void {
 function openDeleteTags(host: DialogHost, tags: readonly string[]): void {
   const { store } = host
   const handle = openOverlay(
-    host,
+    host.root,
     tags.length === 1 ? `Delete "${tags[0] ?? ''}"` : `Delete ${tags.length} tags`,
     'Tag associations are removed from the characters below. No characters are deleted.',
   )
@@ -1053,35 +1013,48 @@ function openDeleteTags(host: DialogHost, tags: readonly string[]): void {
   const totalFor = (names: readonly string[]): number =>
     names.reduce((sum, name) => sum + countFor(name), 0)
 
+  /**
+   * The tags being removed, each with its REAL assignment count.
+   *
+   * This is the whole point of the dialog: "delete 3 tags" says nothing about
+   * whether that touches 3 characters or 30,000. The count is read from the
+   * index on every render, so a stale-preview refresh shows the current numbers
+   * rather than the ones the dialog opened with.
+   */
   const renderList = (names: readonly string[]): HTMLElement => {
-    const list = el('div', { class: 'lt-dialog__list' })
-    const shown = names.slice(0, 200)
-    for (const name of shown) {
+    const shown = names.slice(0, REVIEW_ROW_LIMIT)
+    const rows = shown.map((name): (string | Node)[] => {
       const count = countFor(name)
-      const line = el('div', { class: 'lt-row lt-row--wrap' })
-      line.appendChild(el('strong', {}, [name]))
-      line.appendChild(
-        el('span', { class: 'lt-badge' }, [
-          count === 0 ? 'no assignments' : characterCount(count),
-        ]),
-      )
-      list.appendChild(line)
-    }
-    if (names.length > shown.length) {
-      list.appendChild(
-        el('div', { class: 'lt-dialog__desc' }, [
-          `…and ${names.length - shown.length} more tags`,
-        ]),
-      )
-    }
+      return [
+        name,
+        badge(count === 0 ? 'no assignments' : characterCount(count), {
+          // "No assignments" is a fact about the tag, not an error; it stays
+          // muted so a real count never has to compete with it.
+          tone: count === 0 ? 'muted' : 'default',
+        }),
+      ]
+    })
     if (names.length === 0) {
-      list.appendChild(el('div', { class: 'lt-dialog__desc' }, ['(no tags selected)']))
+      return el('p', { class: 'lt-dialog__desc' }, ['(no tags selected)'])
     }
-    return list
+    const block = el('div')
+    block.appendChild(
+      reviewTable(
+        [
+          [tags.length === 1 ? 'Tag' : 'Tags', '62%'],
+          ['Assignments', '38%'],
+        ],
+        rows,
+      ),
+    )
+    if (names.length > shown.length) {
+      block.appendChild(truncationNote(shown.length, names.length, 'tags'))
+    }
+    return block
   }
 
   const listHost = el('div')
-  const wrap = el('div', { class: 'lt-dialog__summary' })
+  const wrap = el('div')
   wrap.appendChild(
     el('p', { class: 'lt-dialog__desc' }, [
       'These tags will be removed from every character that has them, across the whole library — not only the ones currently visible.',
@@ -1114,7 +1087,7 @@ function openDeleteTags(host: DialogHost, tags: readonly string[]): void {
   })
   setActions(
     handle,
-    button('Cancel', { variant: 'ghost', onClick: () => handle.close() }),
+    button('Cancel', { variant: 'default', onClick: () => handle.close() }),
     confirmButton,
   )
 
@@ -1157,7 +1130,7 @@ function openDeleteTags(host: DialogHost, tags: readonly string[]): void {
 function openBulkAssignReview(host: DialogHost): void {
   const { store } = host
   const handle = openOverlay(
-    host,
+    host.root,
     'Review assignment',
     'Assignment only ever adds tags. It never removes a tag a character already has.',
   )
@@ -1169,9 +1142,31 @@ function openBulkAssignReview(host: DialogHost): void {
   const nameFor = (id: string): string =>
     store.view.characters.find((c) => c.id === id)?.name || id
 
-  const wrap = el('div', { class: 'lt-dialog__summary' })
-  wrap.appendChild(el('p', {}, [el('strong', {}, [`Tags (${tagNames.length})`])]))
-  wrap.appendChild(cappedList(tagNames))
+  const wrap = el('div')
+  // The tags get a real table: each one carries the number of characters it is
+  // on, and "3 tags" without that weight is exactly the ambiguity this review
+  // exists to remove. The characters stay a list — they have no per-row
+  // attribute worth a column, and a list of names reads faster than a one-cell
+  // table.
+  const tagRows = tagNames.slice(0, REVIEW_ROW_LIMIT).map((name): (string | Node)[] => {
+    const count = store.view.tagIndex.byKey.get(tagKey(name))?.count ?? 0
+    return [name, badge(characterCount(count), { tone: 'default' })]
+  })
+  const tagBlock = el('div')
+  tagBlock.appendChild(
+    reviewTable(
+      [
+        [`Tags (${tagNames.length})`, '64%'],
+        ['Characters already tagged', '36%'],
+      ],
+      tagRows,
+    ),
+  )
+  if (tagNames.length > REVIEW_ROW_LIMIT) {
+    tagBlock.appendChild(truncationNote(REVIEW_ROW_LIMIT, tagNames.length, 'tags'))
+  }
+  wrap.appendChild(tagBlock)
+
   wrap.appendChild(el('p', { class: 'lt-dialog__desc' }, [`Characters (${characterIds.length})`]))
   wrap.appendChild(cappedList(characterIds.map(nameFor)))
   wrap.appendChild(
@@ -1197,7 +1192,7 @@ function openBulkAssignReview(host: DialogHost): void {
   setDisabled(confirmButton, !ready)
   setActions(
     handle,
-    button('Cancel', { variant: 'ghost', onClick: () => handle.close() }),
+    button('Cancel', { variant: 'default', onClick: () => handle.close() }),
     confirmButton,
   )
 
@@ -1238,7 +1233,7 @@ function openBulkAssignReview(host: DialogHost): void {
 function openBulkUnassignReview(host: DialogHost): void {
   const { store } = host
   const handle = openOverlay(
-    host,
+    host.root,
     'Review unassignment',
     'Unassignment only ever removes the tags below, and only from the selected characters.',
   )
@@ -1250,9 +1245,27 @@ function openBulkUnassignReview(host: DialogHost): void {
   const nameFor = (id: string): string =>
     store.view.characters.find((c) => c.id === id)?.name || id
 
-  const wrap = el('div', { class: 'lt-dialog__summary' })
-  wrap.appendChild(el('p', {}, [el('strong', {}, [`Tags to remove (${tagNames.length})`])]))
-  wrap.appendChild(cappedList(tagNames))
+  const wrap = el('div')
+  const tagRows = tagNames.slice(0, REVIEW_ROW_LIMIT).map((name): (string | Node)[] => [
+    name,
+    badge(characterCount(store.view.tagIndex.byKey.get(tagKey(name))?.count ?? 0), {
+      tone: 'default',
+    }),
+  ])
+  const tagBlock = el('div')
+  tagBlock.appendChild(
+    reviewTable(
+      [
+        [`Tags to remove (${tagNames.length})`, '64%'],
+        ['Characters carrying it', '36%'],
+      ],
+      tagRows,
+    ),
+  )
+  if (tagNames.length > REVIEW_ROW_LIMIT) {
+    tagBlock.appendChild(truncationNote(REVIEW_ROW_LIMIT, tagNames.length, 'tags'))
+  }
+  wrap.appendChild(tagBlock)
   wrap.appendChild(
     el('p', { class: 'lt-dialog__desc' }, [
       `Selected characters (${characterIds.length}) — no other character is touched`,
@@ -1284,7 +1297,7 @@ function openBulkUnassignReview(host: DialogHost): void {
   setDisabled(confirmButton, !ready)
   setActions(
     handle,
-    button('Cancel', { variant: 'ghost', onClick: () => handle.close() }),
+    button('Cancel', { variant: 'default', onClick: () => handle.close() }),
     confirmButton,
   )
 
@@ -1312,14 +1325,22 @@ function openBulkUnassignReview(host: DialogHost): void {
 // search_help
 // ---------------------------------------------------------------------------
 
+/**
+ * One help section: a small-caps heading and a syntax → meaning list.
+ *
+ * The syntax token is a real `<code>` (`.lt-dialog code` gives it the mono face,
+ * the subtle fill and the `overflow-wrap` that keeps `T:Elf` from widening the
+ * dialog), and the meaning sits in its own column rather than after an em dash,
+ * so a long description wraps beside its own text instead of trailing the token.
+ */
 function renderHelpSection(section: SearchHelpSection): HTMLElement {
-  const wrap = el('div')
+  const wrap = el('div', { class: 'lt-box' })
   wrap.appendChild(el('h4', { class: 'lt-dialog__title' }, [section.title]))
-  const list = el('div', { class: 'lt-dialog__list' })
+  const list = el('div', { class: 'lt-list' })
   for (const entry of section.entries) {
-    const line = el('div', {})
+    const line = el('div', { class: 'lt-row lt-row--wrap' })
     line.appendChild(el('code', {}, [entry.syntax]))
-    line.appendChild(el('span', { class: 'lt-dialog__desc' }, [` — ${entry.description}`]))
+    line.appendChild(el('span', { class: 'lt-dialog__desc lt-row--grow' }, [entry.description]))
     list.appendChild(line)
   }
   wrap.appendChild(list)
@@ -1332,21 +1353,26 @@ function renderHelpSection(section: SearchHelpSection): HTMLElement {
  * The `A:` field list is spelled out field by field, because "searches these
  * fields" inside a sentence is exactly the kind of thing users misread as
  * "searches everything".
+ *
+ * This is the one dialog that is a REFERENCE rather than a form, so it keeps the
+ * full syntax listing rather than being narrowed to the confirmation shell:
+ * `.lt-dialog__body` is the scroll container, the sections stack inside it with
+ * the box rhythm, and the footer keeps a single Close control.
  */
 function openSearchHelp(host: DialogHost, context: 'tags' | 'characters'): void {
   const handle = openOverlay(
-    host,
+    host.root,
     context === 'tags' ? 'Search help — Tags' : 'Search help — Characters',
     'The search syntax is the same everywhere in LumiTag.',
   )
 
-  const wrap = el('div')
+  const wrap = el('div', { class: 'lt-box' })
   for (const section of host.store.actions.searchHelp(context)) {
     wrap.appendChild(renderHelpSection(section))
   }
 
   if (context === 'tags') {
-    const note = el('div')
+    const note = el('div', { class: 'lt-box' })
     note.appendChild(el('h4', { class: 'lt-dialog__title' }, ['In the Tags list']))
     note.appendChild(
       el('p', { class: 'lt-dialog__desc' }, [
@@ -1411,11 +1437,13 @@ export function installDialogHost(host: DialogHost): () => void {
     if (disposed) return
     disposed = true
     // Closing every overlay first means no listener or node outlives the host.
-    // The overlays are mounted on document.body (see portalParent), not under
+    // The overlays are mounted on document.body (see `portalParent`), not under
     // host.root, so this disposer is the ONLY thing that takes them off the
-    // page — it must not be skipped.
-    for (const overlay of [...stackFor(host.root)]) overlay.close()
-    // Clearing with a no-op is safe: `requestDialog` no-ops without an opener.
-    setDialogOpener(() => {})
+    // page — it must not be skipped. Closing also releases the body scroll lock
+    // and returns focus to whatever opened each dialog.
+    closeAllOverlays(host.root)
+    // `requestDialog` then no-ops again, rather than routing a late click at a
+    // store that is being torn down.
+    clearDialogOpener()
   }
 }

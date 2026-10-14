@@ -24,9 +24,11 @@
  *    reports the failure beside it.
  * 5. **Every listener is disposable.** Listeners are attached only through
  *    `on()` and their disposers are tracked, so `destroy()` releases all of
- *    them. The `dom.ts` builders that bake in listeners (`searchInput`,
- *    `select`, `checkbox`, `chip`) are therefore NOT used here; equivalents
- *    are built below from `el` + tracked `on`.
+ *    them. `dom.select()` is used for the sort and filter controls: its listener
+ *    is registered against the node it owns, so `dom.clear()` — which both the
+ *    re-render path and `destroy()` call — releases it with the node. The
+ *    search boxes are built below from `el` + tracked `on`, because each of
+ *    them also owns the focus/caret listeners that must survive a rebuild.
  * 6. **Re-rendering is the shell's job.** `renderShell` rebuilds the section
  *    on every store change, so this renderer does not subscribe to the store
  *    itself (a second subscription would leak a listener per shell render).
@@ -40,6 +42,18 @@
  *    and {@link TAG_OPTION_LIMIT} tag options are rendered per page, with pager
  *    controls beneath each. Selection is GLOBAL and survives a page change;
  *    counts always come from the store's totals rather than from the page.
+ *
+ * ## Visual contract (overhaul.txt §3B, §3C, §3E, §3F, §3G, §3J, §4)
+ *
+ * The section uses the SAME ladder as the Tags section — a compact context
+ * line, the search field, the sort and filter controls, the primary and
+ * secondary actions, the rows, then the pager and the contextual status — so
+ * the two views read as siblings in one feature. Rows follow the host's
+ * character/avatar convention (WorldBookPanel.tsx, WorldBookEntriesSection.tsx):
+ * a rounded-square avatar with an initials fallback, the name at row-title
+ * weight and everything else as muted metadata. The bulk block and each tag
+ * picker are native `<details>` disclosures styled after the host's
+ * `CollapsibleSection`.
  */
 
 import type {
@@ -60,7 +74,23 @@ import {
 } from '../store'
 import { tagKey } from '../tag-index'
 import { requestDialog } from './dialog-host'
-import { avatar, button, clear, el, emptyState, field, on, pager, sectionEl, setBusy, setDisabled, spinner, text } from './dom'
+import {
+  avatar,
+  badge,
+  button,
+  clear,
+  el,
+  emptyState,
+  field,
+  on,
+  pager,
+  sectionEl,
+  select,
+  setBusy,
+  setDisabled,
+  spinner,
+  text,
+} from './dom'
 
 /**
  * Options rendered per page in a tag picker.
@@ -301,44 +331,36 @@ export function renderCharactersSection(options: {
     return input
   }
 
-  const buildSelect = <T extends string>(
-    value: T,
-    options: readonly { value: T; label: string }[],
-    ariaLabel: string,
-    onChange: (v: T) => void,
-  ): HTMLSelectElement => {
-    const node = el('select', { class: 'lt-select', 'aria-label': ariaLabel })
-    for (const option of options) {
-      node.appendChild(el('option', { value: option.value }, [option.label]))
-    }
-    node.value = value
-    track(
-      on(node, 'change', () => {
-        const next = node.value as T
-        // An unknown value can only come from a stale DOM; ignore it rather
-        // than feeding the store a mode it does not know.
-        if (options.some((o) => o.value === next)) onChange(next)
-      }),
-    )
-    return node
-  }
-
   /**
-   * A search box that survives the shell's full rebuild.
+   * A search box that survives the shell's full rebuild, in the host's
+   * `SearchField` structure.
    *
    * Focus and caret are recorded in module state ({@link prevSlot},
    * {@link prevSlotCaret}) and restored by {@link restoreSearchIntents} after
    * the rebuild, so typing does not lose the caret mid-word. `slot` is the
    * stable identity used to find this box again after the rebuild.
+   *
+   * The pill (`.lt-searchfield`, with its borderless input and its own clear
+   * control) is assembled here rather than through `dom.searchInput()` for one
+   * reason: every listener on this box — the four focus/caret ones, the query
+   * commit and the clear control — has to sit in this renderer's disposer set,
+   * because that set is what the test suite inspects to prove `destroy()`
+   * releases everything. The class names are the contract with `styles.ts` §6.
+   *
+   * `grow` decides which existing layout class the pill also takes: the
+   * toolbar's primary search flexes and wraps to a full row on a narrow drawer
+   * (`lt-toolbar__search`); a picker's own search box sits inside the picker
+   * body and is already full width there.
    */
   const buildSearch = (
     slot: string,
     placeholder: string,
     value: string,
     onInput: (v: string) => void,
-  ): HTMLInputElement => {
+    grow: boolean,
+  ): HTMLElement => {
     const input = el('input', {
-      class: 'lt-search',
+      class: 'lt-search lt-searchfield__input',
       type: 'search',
       'aria-label': placeholder,
       placeholder,
@@ -370,7 +392,40 @@ export function renderCharactersSection(options: {
     }
     track(on(input, 'keyup', recordCaret))
     track(on(input, 'select', recordCaret))
-    return input
+
+    // The host draws its own clear control and hides the UA one
+    // (SearchField.module.css:22), so it is visible only while there is
+    // something to clear. Icon-only ⇒ it carries both a name and a tooltip.
+    const clearLabel = `Clear ${placeholder}`
+    const clearBtn = button('×', { variant: 'icon-sm', ariaLabel: clearLabel, title: clearLabel })
+    clearBtn.setAttribute('class', 'lt-btn lt-btn--icon-sm lt-searchfield__clear')
+    clearBtn.hidden = value === ''
+    track(
+      on(clearBtn, 'click', () => {
+        input.value = ''
+        clearBtn.hidden = true
+        onInput('')
+        // Clearing must leave the reader typing in the same box.
+        input.focus()
+      }),
+    )
+    track(
+      on(input, 'input', () => {
+        clearBtn.hidden = input.value === ''
+      }),
+    )
+
+    // The wrapper IS the pill: `.lt-searchfield` supplies the host's row layout
+    // (row direction, 8px gap, 8px 12px padding, 10px radius, `--fill-subtle`,
+    // hairline, `:focus-within` border) and its `> .lt-search` rule makes the
+    // input borderless inside it. A `.lt-field` wrapper would be the wrong
+    // choice here — `styles.ts` §6 would paint a SECOND pill around this one.
+    const wrapper = el('label', {
+      class: grow ? 'lt-searchfield lt-toolbar__search' : 'lt-searchfield',
+    })
+    wrapper.appendChild(input)
+    wrapper.appendChild(clearBtn)
+    return wrapper
   }
 
   /**
@@ -406,19 +461,78 @@ export function renderCharactersSection(options: {
   // Toolbar
   // ---------------------------------------------------------------------
 
+  /**
+   * One compact line above the toolbar: what this list is, how much of the
+   * library the current query/filter/sort left, and — once the reader starts
+   * selecting — how much is selected and whether that selection reaches past
+   * this page.
+   *
+   * Deliberately NOT a `.lt-state`: that class is the empty/loading treatment
+   * (centred, italic, padded) and it is also one of the shell's scroll-anchor
+   * selectors, so a status line must not borrow it.
+   *
+   * It stays a one-liner: the "N of them ticked on this page" caveat lives on
+   * the bulk banner below, where the selection is acted on, so saying it here
+   * as well would just repeat it.
+   */
+  const renderContext = (view: StoreView): HTMLElement => {
+    const bar = el('div', { class: 'lt-row lt-row--wrap' })
+    bar.appendChild(el('span', { class: 'lt-tag-row__name' }, ['Characters']))
+
+    const matching = view.characterRows.length
+    bar.appendChild(
+      badge(
+        matching === view.characterCount
+          ? characterCountLabel(matching)
+          : `${characterCountLabel(matching)} of ${characterCountLabel(view.characterCount)}`,
+        { title: 'How many characters the current search, sort and filters leave' },
+      ),
+    )
+
+    if (view.activeFilterTagKeys.length > 0) {
+      bar.appendChild(
+        badge(`${selectedTagCountLabel(view.activeFilterTagKeys.length)} in the filter`, {
+          tone: 'accent',
+          title: 'Tags the ANY / ALL filter is being applied to',
+        }),
+      )
+    }
+
+    const selected = view.selectedCharacterIds.length
+    if (selected > 0) {
+      bar.appendChild(
+        badge(characterCountLabel(selected), {
+          tone: 'accent',
+          title: 'Characters selected for bulk tag assignment (selection spans every page)',
+        }),
+      )
+    }
+
+    return bar
+  }
+
+  /**
+   * Search, sort and filter — in that order, because that is the order the
+   * reader narrows the list in.
+   *
+   * `dom.select()` supplies the host's `.lt-selectfield` chevron wrapper, and
+   * `dom.field()` picks that wrapper up automatically, so the control renders
+   * as the host's complete select while the `<label>` still names it.
+   */
   const renderToolbar = (view: StoreView): HTMLElement => {
     const bar = el('div', { class: 'lt-toolbar', role: 'toolbar', 'aria-label': 'Character actions' })
 
-    const search = buildSearch('characters', 'Search characters & tags', view.characterQuery, (value) => {
-      if (searchTimer) clearTimeout(searchTimer)
-      searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), SEARCH_DEBOUNCE_MS)
-    })
-    bar.appendChild(el('div', { class: 'lt-toolbar__grow' }, [field('Search', search)]))
+    bar.appendChild(
+      buildSearch('characters', 'Search characters & tags', view.characterQuery, (value) => {
+        if (searchTimer) clearTimeout(searchTimer)
+        searchTimer = setTimeout(() => store.actions.setCharacterQuery(value), SEARCH_DEBOUNCE_MS)
+      }, true),
+    )
 
     bar.appendChild(
       field(
         'Sort by',
-        buildSelect(view.characterSort, SORT_OPTIONS, 'Sort characters by', (value) =>
+        select(SORT_OPTIONS, view.characterSort, (value) =>
           store.actions.setCharacterSort(value),
         ),
       ),
@@ -427,7 +541,7 @@ export function renderCharactersSection(options: {
     bar.appendChild(
       field(
         'Filter by tags',
-        buildSelect(view.characterTagFilter, FILTER_OPTIONS, 'Filter characters by their tags', (value) =>
+        select(FILTER_OPTIONS, view.characterTagFilter, (value) =>
           store.actions.setCharacterTagFilter(value),
         ),
         '“Has ANY of these tags” matches a character carrying at least one of the picked tags; ' +
@@ -513,7 +627,7 @@ export function renderCharactersSection(options: {
     emptyMessage: string
     onSelectionChange: (keys: string[]) => void
   }): HTMLElement => {
-    const box = sectionEl('lt-box')
+    const box = el('div', { class: 'lt-box' })
     box.appendChild(el('p', { class: 'lt-state__title' }, [config.title]))
     box.appendChild(el('p', { class: 'lt-state__detail' }, [config.description]))
 
@@ -531,7 +645,7 @@ export function renderCharactersSection(options: {
     const chips = el('div', { class: 'lt-subtag-list' })
     chips.setAttribute('aria-label', `${config.title}: current selection`)
     if (selectedCount === 0) {
-      chips.appendChild(el('span', { class: 'lt-badge lt-badge--muted' }, ['nothing selected yet']))
+      chips.appendChild(badge('nothing selected yet', { tone: 'muted' }))
     }
     for (const key of config.selectedKeys) {
       const entry = store.view.tagIndex.byKey.get(key)
@@ -562,8 +676,11 @@ export function renderCharactersSection(options: {
           render()
         }, SEARCH_DEBOUNCE_MS)
       },
+      // Inside the picker body the field is already full width, so it does not
+      // need the toolbar's flex growth (which would fight the body column).
+      false,
     )
-    body.appendChild(field('Find a tag', search))
+    body.appendChild(search)
 
     const needle = query.trim().toLowerCase()
     const matches = store.view.tagIndex.tags.filter(
@@ -617,11 +734,7 @@ export function renderCharactersSection(options: {
         ),
       )
       line.appendChild(el('span', { class: 'lt-tag-row__name' }, [entry.name]))
-      line.appendChild(
-        el('span', { class: 'lt-badge' }, [
-          characterCountLabel(entry.count),
-        ]),
-      )
+      line.appendChild(badge(characterCountLabel(entry.count)))
       options.appendChild(line)
     }
     if (matches.length > 0) body.appendChild(options)
@@ -670,9 +783,9 @@ export function renderCharactersSection(options: {
         `${matches.length === 0 ? 'Nothing matches this search.' : ''} show / hide the tag list`,
     })
     summary.appendChild(
-      el('span', { class: selectedCount > 0 ? 'lt-badge lt-badge--accent' : 'lt-badge lt-badge--muted' }, [
-        selectedTagCountLabel(selectedCount),
-      ]),
+      badge(selectedTagCountLabel(selectedCount), {
+        tone: selectedCount > 0 ? 'accent' : 'muted',
+      }),
     )
     summary.appendChild(el('span', { class: 'lt-tag-picker__sub' }, ['find a tag']))
     details.appendChild(summary)
@@ -866,12 +979,11 @@ export function renderCharactersSection(options: {
     })
     // Reuse the same count wording as the row badge rather than keeping a
     // second source of truth: collapsed, this line IS the row's tag count.
-    summary.appendChild(el('span', { class: 'lt-badge' }, [tagCountLabel(tags.length)]))
+    summary.appendChild(badge(tagCountLabel(tags.length)))
     if (hasChipError) {
-      // `lt-badge--accent` is the strongest existing badge emphasis; a
-      // dedicated `--error` badge is listed in the CSS report for whoever owns
-      // `styles.ts`, so this renders correctly either way.
-      summary.appendChild(el('span', { class: 'lt-badge lt-badge--accent' }, ['removal failed']))
+      // A failed write is a state, so it gets the strongest badge tone there
+      // is rather than being left to the surrounding prose.
+      summary.appendChild(badge('removal failed', { tone: 'danger' }))
     }
     // State-neutral wording: the native marker already says which way the
     // disclosure points, and "show tags" would be a lie while it is open.
@@ -937,9 +1049,12 @@ export function renderCharactersSection(options: {
     const title = el('div', { class: 'lt-character-row__title' })
     title.appendChild(el('span', { class: 'lt-character-row__name' }, [displayName]))
     title.appendChild(
-      el('span', { class: 'lt-badge' }, [tags.length === 0 ? 'No tags' : tagCountLabel(tags.length)]),
+      badge(tags.length === 0 ? 'No tags' : tagCountLabel(tags.length), {
+        tone: tags.length === 0 ? 'muted' : 'default',
+        title: 'How many tags this character currently carries',
+      }),
     )
-    title.appendChild(el('span', { class: 'lt-badge lt-badge--muted' }, [shortId(id)]))
+    title.appendChild(badge(shortId(id), { tone: 'muted' }))
     main.appendChild(title)
 
     // Errors are read BEFORE the chips are built because they decide whether
@@ -1053,8 +1168,8 @@ export function renderCharactersSection(options: {
     banner.appendChild(
       el('strong', {}, [
         hasCharacters
-          ? `Bulk Tag Assignment — ${characterCountLabel(characterCount)} selected`
-          : 'Bulk Tag Assignment',
+          ? `${characterCountLabel(characterCount)} selected`
+          : 'Nothing selected yet',
       ]),
     )
     banner.appendChild(
@@ -1073,9 +1188,10 @@ export function renderCharactersSection(options: {
     const counts = el('div', { class: 'lt-row lt-row--wrap' })
     counts.appendChild(el('span', { class: 'lt-tag-row__meta' }, ['Selected characters:']))
     counts.appendChild(
-      el('span', { class: hasCharacters ? 'lt-badge lt-badge--accent' : 'lt-badge lt-badge--muted' }, [
-        characterCountLabel(characterCount),
-      ]),
+      badge(characterCountLabel(characterCount), {
+        tone: hasCharacters ? 'accent' : 'muted',
+        title: 'Characters selected across every page',
+      }),
     )
     // Selection is global but the list is paged, so say so whenever a selection
     // spans more than the rows on screen — otherwise the count reads as "only
@@ -1090,15 +1206,16 @@ export function renderCharactersSection(options: {
     }
     counts.appendChild(el('span', { class: 'lt-tag-row__meta' }, ['Selected tags:']))
     counts.appendChild(
-      el('span', { class: hasTags ? 'lt-badge lt-badge--accent' : 'lt-badge lt-badge--muted' }, [
-        selectedTagCountLabel(tagCount),
-      ]),
+      badge(selectedTagCountLabel(tagCount), {
+        tone: hasTags ? 'accent' : 'muted',
+        title: 'Tags both Assign and Unassign will act on',
+      }),
     )
     banner.appendChild(counts)
 
     const actions = el('div', { class: 'lt-toolbar__actions' })
 
-    const selectAll = button('Select All (matching)', {
+    const selectAll = button('Select All (matching characters)', {
       title:
         'Select every character matching your current search, sort and filters, across ALL pages — ' +
         'not every character in your library. Tags ticked on an earlier page stay ticked.',
@@ -1199,7 +1316,8 @@ export function renderCharactersSection(options: {
     // the chip is gone the entry is dead weight in a module-scope map.
     pruneChipErrors(view)
 
-    const root = sectionEl('lt-box')
+    const root = el('div', { class: 'lt-box' })
+    root.appendChild(renderContext(view))
     root.appendChild(renderToolbar(view))
 
     const errors = renderQueryErrors(view)
@@ -1214,9 +1332,23 @@ export function renderCharactersSection(options: {
 
     root.appendChild(renderActiveFilterPicker(view))
 
-    // Bulk tag assignment block at the top, collapsible
+    // Bulk tag assignment block at the top, collapsible.
+    //
+    // A native `<details>` would be the obvious choice, but this one block's
+    // open/closed state is deliberately NOT remembered: it is a scratchpad that
+    // resets on every rebuild, and a remembered collapse would hide a live
+    // selection the reader had just made. So it is an explicit
+    // `aria-expanded` toggle, styled by `.lt-bulk-host*` after the host's
+    // `CollapsibleSection` (transparent header, hairline divider, 13px/600
+    // title, dimmed chevron, 10px content padding).
     const bulkHost = el('div', { class: 'lt-bulk-host' })
-    const bulkHeader = el('button', { class: 'lt-bulk-host__toggle', type: 'button', 'aria-expanded': 'true', 'aria-label': 'Toggle bulk tag assignment block' })
+    const bulkHeader = el('button', {
+      class: 'lt-bulk-host__toggle',
+      type: 'button',
+      'aria-expanded': 'true',
+      'aria-label': 'Toggle bulk tag assignment block',
+      title: 'Show or hide the bulk tag assignment controls',
+    })
     bulkHeader.appendChild(
       el('span', { class: 'lt-bulk-host__label' }, ['Bulk Tag Assignment / Unassignment']),
     )
