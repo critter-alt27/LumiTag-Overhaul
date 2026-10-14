@@ -717,7 +717,7 @@ export const LUMITAG_CSS = `
   width: 100%;
   min-width: 0;
   box-sizing: border-box;
-  padding: 10px 28px 10px 12px;
+  padding: 6px 28px 6px 12px;
   border: 1px solid var(--lumiverse-border, CanvasText);
   border-radius: var(--lumiverse-radius, 8px);
   background: var(--lumiverse-bg, var(--lumiverse-input-bg, Canvas));
@@ -744,18 +744,19 @@ export const LUMITAG_CSS = `
 .lt-selectfield {
   position: relative;
   display: inline-flex;
+  width: 100%;
   min-width: 0;
 }
 
 .lt-selectfield > .lt-select {
   appearance: none;
   -webkit-appearance: none;
-  padding-right: 32px;
+  padding-right: 28px;
 }
 
 .lt-selectfield__chevron {
   position: absolute;
-  right: 12px;
+  right: 8px;
   top: 50%;
   transform: translateY(-50%);
   display: flex;
@@ -765,8 +766,8 @@ export const LUMITAG_CSS = `
 
 .lt-selectfield__chevron svg {
   display: block;
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
 }
 
 /*
@@ -857,7 +858,7 @@ export const LUMITAG_CSS = `
    border and fill — the host's '.globalSection' block. */
 .lt-toolbar__banner {
   display: flex;
-  flex: 1 0 100%;
+  flex: 0 0 auto;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 10px;
